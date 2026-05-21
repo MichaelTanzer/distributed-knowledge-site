@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Distributed Knowledge</title>
+  <meta name="description" content="Distributed Knowledge." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <style>
+    :root {
+      --bg: #6f736d;
+      --ink: #f5f5f1;
+      --muted: rgba(245, 245, 241, 0.66);
+      --olive: #c9cbc5;
+      --olive-light: rgba(245, 245, 241, 0.38);
+      --gold: #d0ad56;
+      --gold-light: #f1d27a;
+      --gold-dark: #8a6a2a;
+      --line: rgba(245, 245, 241, 0.11);
+      --sans: "Helvetica Now Display", "Helvetica Now Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      --mono: "Helvetica Now Display", "Helvetica Now Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      color: var(--ink);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at 78% 72%, rgba(245, 245, 241, 0.075), transparent 34rem),
+        radial-gradient(circle at 18% 18%, rgba(0, 0, 0, 0.10), transparent 30rem),
+        var(--bg);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: radial-gradient(rgba(245,245,241,0.16) 0.5px, transparent 0.5px);
+      background-size: 4px 4px;
+      opacity: 0.10;
+      mix-blend-mode: screen;
+    }
+
+    .frame {
+      min-height: 100svh;
+      position: relative;
+      padding: clamp(34px, 5vw, 82px);
+      display: grid;
+      grid-template-columns: minmax(300px, 0.95fr) minmax(320px, 1.05fr);
+      grid-template-rows: 1fr;
+      align-items: center;
+      gap: clamp(42px, 6vw, 96px);
+      overflow: visible;
+    }
+
+    .title-stack {
+      position: relative;
+      z-index: 2;
+      width: min(760px, 100%);
+    }
+
+    .name {
+      margin: 0;
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: clamp(54px, 7.4vw, 112px);
+      line-height: 0.92;
+      font-weight: 300;
+      letter-spacing: -0.064em;
+      text-transform: none;
+      text-rendering: geometricPrecision;
+    }
+
+    .name span {
+      display: block;
+      white-space: nowrap;
+    }
+
+    .name span + span {
+      margin-top: -0.02em;
+      letter-spacing: -0.055em;
+    }
+
+    .mark-stack {
+      position: relative;
+      z-index: 2;
+      justify-self: end;
+      width: min(44vw, 660px);
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .tagline {
+      position: relative;
+      z-index: 2;
+      margin: clamp(18px, 2.2vw, 30px) 0 0 0;
+      max-width: 42ch;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: clamp(12px, 1.22vw, 19px);
+      line-height: 1.16;
+      font-weight: 400;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .glyph {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1;
+      opacity: 0.98;
+    }
+
+    .glyph svg {
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+      filter: drop-shadow(0 20px 30px rgba(17, 19, 15, 0.10));
+    }
+
+    .compass-ring {
+      fill: none;
+      stroke: rgba(245, 245, 241, 0.24);
+      stroke-width: 1.15;
+    }
+
+    .compass-ring.faint {
+      stroke: rgba(245, 245, 241, 0.12);
+      stroke-width: 0.9;
+    }
+
+    .compass-star {
+      fill: rgba(208, 173, 86, 0.22);
+      stroke: rgba(245, 245, 241, 0.76);
+      stroke-width: 1.45;
+      stroke-linejoin: round;
+    }
+
+    .compass-star.alt {
+      fill: rgba(17, 19, 15, 0.28);
+      stroke: rgba(245, 245, 241, 0.48);
+    }
+
+    .compass-axis {
+      fill: none;
+      stroke: rgba(245, 245, 241, 0.68);
+      stroke-width: 1.25;
+      stroke-linecap: round;
+    }
+
+    .compass-axis.gold {
+      stroke: url(#spiralGold);
+      stroke-width: 2;
+    }
+
+    .map-halo {
+      fill: rgba(245, 245, 241, 0.045);
+    }
+
+    .map-plane {
+      fill: rgba(245, 245, 241, 0.12);
+      stroke: rgba(245, 245, 241, 0.18);
+      stroke-width: 1.1;
+    }
+
+    .map-grid {
+      fill: none;
+      stroke: rgba(245, 245, 241, 0.18);
+      stroke-width: 0.95;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .map-vector {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 1.55;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      opacity: 0.72;
+    }
+
+    .map-vector.light {
+      stroke: rgba(245, 245, 241, 0.34);
+      stroke-width: 1.25;
+      opacity: 0.9;
+    }
+
+    .graph-guide {
+      fill: none;
+      stroke: rgba(196, 148, 46, 0.18);
+      stroke-width: 1.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-dasharray: 5 10;
+    }
+
+    .graph-edge {
+      fill: none;
+      stroke: url(#spiralGold);
+      stroke-width: 2.15;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      opacity: 0.88;
+    }
+
+    .graph-edge.secondary {
+      stroke: rgba(245, 245, 241, 0.36);
+      stroke-width: 1.1;
+      opacity: 0.74;
+    }
+
+    .gold-axis {
+      fill: none;
+      stroke: rgba(196, 148, 46, 0.30);
+      stroke-width: 1.05;
+      stroke-linecap: round;
+    }
+
+    .graph-node {
+      fill: url(#spiralGold);
+      stroke: rgba(248, 247, 240, 0.96);
+      stroke-width: 3;
+      filter: drop-shadow(0 4px 9px rgba(128, 83, 20, 0.18));
+    }
+
+    .graph-node.dark {
+      fill: #11130f;
+      stroke: rgba(245, 245, 241, 0.84);
+      stroke-width: 2.4;
+      filter: none;
+    }
+
+    .graph-node.core {
+      stroke: rgba(17, 19, 15, 0.78);
+      stroke-width: 1.35;
+    }
+
+    @media (max-width: 720px) {
+      .frame {
+        grid-template-columns: 1fr;
+        align-content: start;
+        gap: clamp(34px, 8vh, 72px);
+      }
+      .title-stack {
+        width: min(600px, calc(100vw - 48px));
+      }
+      .name {
+        font-size: clamp(48px, 16vw, 76px);
+        line-height: 0.94;
+      }
+      .mark-stack {
+        justify-self: start;
+        width: min(92vw, 520px);
+      }
+      .tagline {
+        max-width: min(42ch, calc(100vw - 48px));
+        margin-top: 20px;
+        font-size: clamp(11px, 3.1vw, 15px);
+        letter-spacing: 0.08em;
+      }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .compass-ring,
+      .compass-star,
+      .compass-axis,
+      .map-plane,
+      .map-grid,
+      .map-vector,
+      .graph-edge,
+      .graph-guide,
+      .gold-axis,
+      .graph-node {
+        animation: settle .95s cubic-bezier(.16,.9,.18,1) both;
+      }
+      .graph-edge,
+      .graph-node { animation-delay: .12s; }
+      @keyframes settle {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="frame" aria-label="Distributed Knowledge">
+    <section class="title-stack" aria-label="Distributed Knowledge mission">
+      <h1 class="name"><span>Distributed</span><span>Knowledge</span></h1>
+      <p class="tagline">Agent research for national security-grade reasoning systems</p>
+    </section>
+
+    <section class="mark-stack" aria-label="Distributed Knowledge mark">
+      <div class="glyph" aria-hidden="true">
+      <svg viewBox="0 0 640 640" role="img" aria-label="Abstract compass rose knowledge map">
+        <defs>
+          <linearGradient id="spiralGold" x1="80" y1="40" x2="560" y2="590" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#f4d976" />
+            <stop offset="0.48" stop-color="#c89a31" />
+            <stop offset="1" stop-color="#805314" />
+          </linearGradient>
+        </defs>
+
+        <ellipse class="map-halo" cx="322" cy="328" rx="282" ry="250" />
+        <polygon class="map-plane" points="82,402 194,122 548,188 520,514 172,558" />
+        <polygon class="map-plane" points="126,222 418,76 584,344 288,504" opacity="0.42" />
+        <polygon class="map-plane" points="72,306 334,150 600,278 466,596 156,486" opacity="0.30" />
+
+        <path class="map-grid" d="M82 402 L548 188 M172 558 L418 76 M194 122 L520 514 M126 222 L584 344 M72 306 L600 278" />
+        <path class="map-grid" d="M126 358 L456 118 L584 344 M214 520 L302 116 L600 278 M94 454 L320 320 L474 560" />
+        <path class="map-vector light" d="M22 246 C132 172 262 142 390 172 S572 288 632 382" />
+        <path class="map-vector light" d="M34 470 C150 382 300 332 476 352 S590 394 634 432" />
+        <path class="map-vector light" d="M84 82 C212 132 288 198 352 322 S482 506 620 584" opacity="0.70" />
+        <path class="map-vector" d="M72 238 C178 126 308 90 488 128" />
+        <path class="map-vector" d="M456 42 L398 604" opacity="0.58" />
+        <path class="map-vector" d="M50 536 L300 166 L612 218" opacity="0.58" />
+        <path class="map-vector" d="M176 58 L592 524" opacity="0.44" />
+
+        <g transform="translate(320 320)">
+          <circle class="compass-ring faint" r="246" />
+          <circle class="compass-ring" r="194" />
+          <circle class="compass-ring faint" r="132" />
+          <circle class="compass-ring" r="54" />
+
+          <path class="compass-axis" d="M0 -278 L0 278 M-278 0 L278 0 M-196 -196 L196 196 M-196 196 L196 -196" />
+          <path class="compass-axis gold" d="M0 -276 L18 -74 L0 -38 L-18 -74 Z" />
+          <path class="compass-axis gold" d="M276 0 L74 18 L38 0 L74 -18 Z" />
+          <path class="compass-axis gold" d="M0 276 L-18 74 L0 38 L18 74 Z" />
+          <path class="compass-axis gold" d="M-276 0 L-74 -18 L-38 0 L-74 18 Z" />
+
+          <polygon class="compass-star" points="0,-250 28,-72 0,-28 -28,-72" />
+          <polygon class="compass-star alt" points="250,0 72,28 28,0 72,-28" />
+          <polygon class="compass-star" points="0,250 -28,72 0,28 28,72" />
+          <polygon class="compass-star alt" points="-250,0 -72,-28 -28,0 -72,28" />
+
+          <polygon class="compass-star alt" points="150,-150 48,-34 30,-4 34,-48" opacity="0.84" />
+          <polygon class="compass-star" points="150,150 34,48 4,30 48,34" opacity="0.70" />
+          <polygon class="compass-star alt" points="-150,150 -48,34 -30,4 -34,48" opacity="0.84" />
+          <polygon class="compass-star" points="-150,-150 -34,-48 -4,-30 -48,-34" opacity="0.70" />
+        </g>
+
+        <path class="graph-edge secondary" d="M320 70 C250 160 228 232 320 320 C412 408 388 494 320 570" opacity="0.36" />
+        <path class="graph-edge secondary" d="M70 320 C166 256 238 228 320 320 C402 412 488 392 570 320" opacity="0.42" />
+        <path class="graph-edge" d="M320 320 L258 198 L320 70 M320 320 L444 238 L570 320 M320 320 L388 454 L320 570 M320 320 L198 382 L70 320" opacity="0.82" />
+        <path class="graph-edge secondary" d="M258 198 L150 142 L96 238 M444 238 L520 154 L598 248 M388 454 L486 528 L404 616 M198 382 L94 450 L150 562" />
+        <path class="graph-edge secondary" d="M150 142 L320 320 L520 154 M96 238 L198 382 L404 616 M598 248 L444 238 L486 528 M150 562 L388 454 L70 320" opacity="0.50" />
+
+        <g>
+          <circle class="graph-node core" cx="320" cy="320" r="11" />
+          <circle class="graph-node" cx="320" cy="70" r="7" />
+          <circle class="graph-node" cx="570" cy="320" r="7" />
+          <circle class="graph-node" cx="320" cy="570" r="7" />
+          <circle class="graph-node" cx="70" cy="320" r="7" />
+          <circle class="graph-node dark" cx="258" cy="198" r="4.8" />
+          <circle class="graph-node dark" cx="444" cy="238" r="4.8" />
+          <circle class="graph-node dark" cx="388" cy="454" r="4.8" />
+          <circle class="graph-node dark" cx="198" cy="382" r="4.8" />
+          <circle class="graph-node" cx="150" cy="142" r="5.5" />
+          <circle class="graph-node" cx="96" cy="238" r="5.2" />
+          <circle class="graph-node" cx="520" cy="154" r="5.5" />
+          <circle class="graph-node" cx="598" cy="248" r="5.2" />
+          <circle class="graph-node" cx="486" cy="528" r="5.5" />
+          <circle class="graph-node" cx="404" cy="616" r="5.2" />
+          <circle class="graph-node" cx="94" cy="450" r="5.5" />
+          <circle class="graph-node" cx="150" cy="562" r="5.2" />
+        </g>
+      </svg>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
