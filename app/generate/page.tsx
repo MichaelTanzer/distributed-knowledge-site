@@ -37,30 +37,21 @@ export default function GeneratePage() {
 
   return (
     <main className="generate-shell">
-      <section className="panel">
-        <p className="eyebrow">Password protected</p>
-        <h1>Generate info-pack</h1>
-        <p className="copy">
-          Enter the recipient email. The system will build two PDF/ZIP packets: an internal
-          experiment packet with answer-bearing artifacts, and an expert packet without answers.
-        </p>
-        <form onSubmit={submit}>
-          <label htmlFor="email">Delivery email</label>
-          <input
-            id="email"
-            type="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            placeholder="name@example.com"
-            required
-          />
-          <button disabled={state.status === 'loading'} type="submit">
-            {state.status === 'loading' ? 'Generating…' : 'Generate package'}
-          </button>
-        </form>
+      <form className="generate-form" onSubmit={submit}>
+        <input
+          aria-label="Delivery email"
+          type="email"
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          placeholder="email"
+          required
+        />
+        <button disabled={state.status === 'loading'} type="submit">
+          {state.status === 'loading' ? 'Generating…' : 'Generate'}
+        </button>
         {state.status === 'success' && <p className="notice success">{state.message}</p>}
         {state.status === 'error' && <p className="notice error">{state.message}</p>}
-      </section>
+      </form>
     </main>
   );
 }
