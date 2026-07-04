@@ -38,6 +38,11 @@ export default function GeneratePage() {
   return (
     <main className="generate-shell">
       <form className="generate-form" onSubmit={submit}>
+        <img
+          alt="DK Team"
+          className="generate-image"
+          src="/assets/dk-team.jpg"
+        />
         <input
           aria-label="Delivery email"
           type="email"
