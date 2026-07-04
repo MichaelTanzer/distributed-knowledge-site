@@ -1,0 +1,76 @@
+:root {
+  --bg: #6f736d;
+  --ink: #f5f5f1;
+  --muted: rgba(245, 245, 241, 0.66);
+  --line: rgba(245, 245, 241, 0.15);
+  --gold: #d0ad56;
+  --dark: #161812;
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  background:
+    radial-gradient(circle at 78% 72%, rgba(245, 245, 241, 0.075), transparent 34rem),
+    radial-gradient(circle at 18% 18%, rgba(0, 0, 0, 0.10), transparent 30rem),
+    var(--bg);
+}
+a { color: inherit; }
+.home, .generate-shell {
+  min-height: 100svh;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: clamp(32px, 8vw, 120px);
+  padding: clamp(34px, 6vw, 92px);
+}
+.home h1, .panel h1 {
+  margin: 0;
+  font-weight: 300;
+  letter-spacing: -0.064em;
+  line-height: 0.92;
+  font-size: clamp(58px, 8vw, 124px);
+}
+.eyebrow, .tagline, .copy, label, button, input, .notice {
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.eyebrow { color: var(--muted); font-size: 12px; margin: 0 0 22px; }
+.tagline, .copy { max-width: 48ch; line-height: 1.35; color: var(--muted); }
+.access, button {
+  display: inline-flex;
+  margin-top: 28px;
+  border: 1px solid var(--line);
+  background: rgba(22,24,18,.18);
+  color: var(--ink);
+  padding: 14px 18px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.mark { font-size: clamp(120px, 28vw, 420px); color: rgba(245,245,241,.16); }
+.generate-shell { grid-template-columns: minmax(320px, 720px); }
+.panel {
+  border: 1px solid var(--line);
+  background: rgba(22,24,18,.16);
+  padding: clamp(26px, 5vw, 56px);
+  backdrop-filter: blur(8px);
+}
+.panel h1 { font-size: clamp(42px, 6vw, 86px); }
+form { display: grid; gap: 14px; margin-top: 34px; }
+label { color: var(--muted); font-size: 11px; }
+input {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: rgba(245,245,241,.08);
+  color: var(--ink);
+  padding: 16px;
+  font-size: 15px;
+  text-transform: none;
+}
+button:disabled { opacity: .55; cursor: wait; }
+.notice { margin-top: 20px; font-size: 12px; line-height: 1.5; }
+.notice.error { color: #ffd0d0; }
+.notice.success { color: #e7f5d6; }
+@media (max-width: 720px) { .home { grid-template-columns: 1fr; } .mark { display: none; } }
