@@ -34,6 +34,7 @@ body::before {
 }
 
 .landing-frame {
+  background: #000000;
   min-height: 100svh;
   position: relative;
   padding: clamp(34px, 5vw, 82px);
