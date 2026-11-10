@@ -6,10 +6,11 @@ import { V4_STAGING_CSS } from './v4StagingStyles';
 
 export const dynamic = 'force-dynamic';
 
-export const metadata: Metadata = {
-  title: 'DK v4 staging',
-  robots: { index: false, follow: false, nocache: true }
-};
+/** Staging metadata only when the page is enabled, so the disabled 404 carries no staging title. */
+export function generateMetadata(): Metadata {
+  if (!stagingEnabled()) return {};
+  return { title: 'DK v4 staging', robots: { index: false, follow: false, nocache: true } };
+}
 
 export default function V4StagingPage() {
   if (!stagingEnabled()) notFound();
