@@ -40,6 +40,11 @@ const UNRESOLVED_MESSAGE =
   'An earlier submission from this browser has an unknown outcome. Retry it first: it reuses the same request key, so it cannot start a second run. New runs are blocked until it resolves.';
 const ACK_PATTERN = /^\d{1,4}\.\d{2}$/;
 
+/** Plain-language notes for backend reason codes (shown under the status). */
+const REASON_MESSAGES: ReadonlyMap<string, string> = new Map([
+  ['blocked_before_launch', 'Not started: another run was still finishing. No charge.']
+]);
+
 const STATE_LABELS: Record<RequestState, string> = {
   queued: 'Queued',
   running: 'Running',
@@ -991,6 +996,9 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
             </dl>
             {tracked.state === 'running' && trackedLane && (
               <p className="v4s-muted">Typical runtime for this lane: {trackedLane.typicalRuntime}.</p>
+            )}
+            {tracked.reasonCode && REASON_MESSAGES.has(tracked.reasonCode) && (
+              <p className="v4s-muted v4s-reason">{REASON_MESSAGES.get(tracked.reasonCode)}</p>
             )}
             {tracked.state === 'interrupted_unreconciled' && (
               <p className="notice error">Needs operator reconciliation; no further runs can start until it is resolved.</p>
