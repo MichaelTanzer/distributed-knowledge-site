@@ -15,8 +15,15 @@ import type {
 
 /** Last tracked request id (resumes polling after a reload). */
 const STORAGE_KEY = 'dkV4Staging.lastRequestId';
-/** Submission whose outcome is not yet known: {key, pilot, lane, ack_cap_usd, createdAt}. */
-const PENDING_KEY = 'dkV4Staging.pendingSubmission';
+/**
+ * Recovery records for submissions whose outcome is not yet known, one per idempotency key:
+ * `dkV4Staging.pending.<key>` = {key, pilot, lane, ack_cap_usd, createdAt}. A record is written (and
+ * read back) before its POST leaves and is removed only when that submission resolves. Records of
+ * other tabs are never overwritten or removed.
+ */
+const PENDING_PREFIX = 'dkV4Staging.pending.';
+/** Single-slot record used before repair round 2; migrated to a per-key record on load. */
+const LEGACY_PENDING_KEY = 'dkV4Staging.pendingSubmission';
 const POLL_INTERVAL_MS = 30_000;
 const POLL_TIMEOUT_MS = 15_000;
 const MAX_POLL_FAILURES = 10;
@@ -28,6 +35,8 @@ const STOP_STATES: ReadonlySet<RequestState> = new Set<RequestState>([...TERMINA
 const KEY_DEPENDENT_CODES: ReadonlySet<string> = new Set(['invalid_idempotency_key', 'idempotency_conflict']);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STORAGE_REQUIRED_MESSAGE = "Can't save submission state in this browser; enable site storage to start a paid run.";
+const UNRESOLVED_MESSAGE =
+  'An earlier submission from this browser has an unknown outcome. Retry it first: it reuses the same request key, so it cannot start a second run. New runs are blocked until it resolves.';
 const ACK_PATTERN = /^\d{1,4}\.\d{2}$/;
 
 const STATE_LABELS: Record<RequestState, string> = {
@@ -120,25 +129,29 @@ function storageWritable(): boolean {
 }
 
 /**
- * Saves the pending submission (key bound to its exact body) and confirms it reads back. A paid
- * submission is only dispatched when this returns true, so its key can always be recovered.
+ * Saves the submission's own recovery record (key bound to its exact body) and confirms it reads
+ * back. A paid submission is only dispatched when this returns true, so its key can be recovered.
  */
-function persistPending(submission: PendingSubmission): boolean {
+function persistRecord(submission: PendingSubmission): boolean {
   const serialized = JSON.stringify(submission);
   try {
-    window.localStorage.setItem(PENDING_KEY, serialized);
-    return window.localStorage.getItem(PENDING_KEY) === serialized;
+    window.localStorage.setItem(PENDING_PREFIX + submission.key, serialized);
+    return window.localStorage.getItem(PENDING_PREFIX + submission.key) === serialized;
   } catch {
     return false;
   }
+}
+
+/** Removes exactly one resolved submission's record; other submissions' records are untouched. */
+function clearRecord(key: string): void {
+  storageRemove(PENDING_PREFIX + key);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function readPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
-  const raw = storageGet(PENDING_KEY);
+function parseRecord(raw: string | null, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
   if (!raw) return null;
   let parsed: unknown = null;
   try {
@@ -163,8 +176,33 @@ function readPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmiss
       return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt };
     }
   }
-  storageRemove(PENDING_KEY);
   return null;
+}
+
+/**
+ * All unresolved submissions recorded in this browser (any tab), oldest first. Unreadable entries are
+ * ignored but never deleted.
+ */
+function listPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission[] {
+  const records: PendingSubmission[] = [];
+  try {
+    const storage = window.localStorage;
+    for (let index = 0; index < storage.length; index += 1) {
+      const name = storage.key(index);
+      if (!name || !name.startsWith(PENDING_PREFIX)) continue;
+      const record = parseRecord(storage.getItem(name), pilots, lanes);
+      if (record && name === PENDING_PREFIX + record.key) records.push(record);
+    }
+  } catch {
+    return records;
+  }
+  return records.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** Moves a pre-round-2 single-slot record to its per-key record (removed only after the copy reads back). */
+function migrateLegacyRecord(pilots: PilotOption[], lanes: LaneOption[]): void {
+  const legacy = parseRecord(storageGet(LEGACY_PENDING_KEY), pilots, lanes);
+  if (legacy && persistRecord(legacy)) storageRemove(LEGACY_PENDING_KEY);
 }
 
 /** 15 s abort for one fetch; falls back to a timer where AbortSignal.timeout is missing. */
@@ -256,7 +294,10 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const [lane, setLane] = useState<LaneValue | ''>('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitState, setSubmitState] = useState<SubmitState>({ status: 'idle' });
-  const [pending, setPending] = useState<PendingSubmission | null>(null);
+  const [pendingList, setPendingList] = useState<PendingSubmission[]>([]);
+  /** Key of the POST currently in flight from this tab; independent of the editable form fields. */
+  const [inFlightKey, setInFlightKey] = useState<string | null>(null);
+  const inFlightRef = useRef<string | null>(null);
   /** null until checked on mount; false blocks paid submissions (their key could not be recovered). */
   const [storageOk, setStorageOk] = useState<boolean | null>(null);
   const [tracked, setTracked] = useState<TrackedRequest | null>(null);
@@ -379,9 +420,21 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     } else if (stored) {
       storageRemove(STORAGE_KEY);
     }
-    setPending(readPending(pilots, lanes));
+    migrateLegacyRecord(pilots, lanes);
+    setPendingList(listPending(pilots, lanes));
     setStorageOk(storageWritable());
   }, [idPattern, lanes, loadConfig, pilots, resetPolling]);
+
+  const refreshPending = useCallback(() => setPendingList(listPending(pilots, lanes)), [lanes, pilots]);
+
+  // Another tab added or resolved a submission: refresh the unresolved list (blocks or unblocks this tab).
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key.startsWith(PENDING_PREFIX)) refreshPending();
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [refreshPending]);
 
   const activeId = tracked && !tracked.stopped && !STOP_STATES.has(tracked.state) ? tracked.requestId : null;
 
@@ -440,7 +493,10 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const backendBusy = config?.runInProgress === true;
   const overDaily =
     effectiveCap !== null && config?.dailyRemainingUsd != null && Number(effectiveCap) > Number(config.dailyRemainingUsd);
-  const submitting = submitState.status === 'submitting';
+  const submitting = inFlightKey !== null;
+  /** Form controls are locked while a POST is in flight or any submission is unresolved. */
+  const locked = submitting || pendingList.length > 0;
+  const visiblePending = pendingList.filter((record) => record.key !== inFlightKey);
 
   const canSubmit =
     config !== null &&
@@ -454,23 +510,36 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     acknowledged &&
     !submitting &&
     storageOk === true &&
-    pending === null &&
+    pendingList.length === 0 &&
     activeId === null;
 
   /**
-   * Sends one submission. Its key and exact body are persisted (and read back) before the request
-   * leaves; if that fails nothing is sent. It is cleared only when it resolves: 202 / 200 replay, or
-   * a definitive 4xx that does not depend on the key, or when the user explicitly dismisses it.
+   * Sends one submission. Its key and exact body are persisted in its own record (and read back)
+   * before the request leaves; if that fails nothing is sent. Only one POST per tab is in flight. The
+   * record is removed only when this submission resolves: 202 / 200 replay, `duplicate`, or a
+   * definitive 4xx that does not depend on the key. There is no way to discard it from the UI.
    */
   async function send(submission: PendingSubmission) {
-    if (!persistPending(submission)) {
+    if (inFlightRef.current !== null) return;
+    if (!persistRecord(submission)) {
       setStorageOk(false);
       setSubmitState({ status: 'error', error: { code: 'storage_unavailable', message: STORAGE_REQUIRED_MESSAGE } });
       return;
     }
-    setPending(submission);
+    inFlightRef.current = submission.key;
+    setInFlightKey(submission.key);
+    refreshPending();
     setSubmitState({ status: 'submitting' });
+    try {
+      await dispatch(submission);
+    } finally {
+      inFlightRef.current = null;
+      setInFlightKey(null);
+      refreshPending();
+    }
+  }
 
+  async function dispatch(submission: PendingSubmission) {
     let response: Response;
     try {
       response = await fetch('/api/v4/requests', {
@@ -492,10 +561,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     }
 
     const payload = await readJson(response);
-    const resolve = () => {
-      storageRemove(PENDING_KEY);
-      setPending(null);
-    };
+    const resolve = () => clearRecord(submission.key);
     if ((response.status === 202 || response.status === 200) && isAcceptedView(payload, idPattern)) {
       resolve();
       startTracking(
@@ -528,6 +594,14 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (inFlightRef.current !== null) return;
+    // Re-read storage at click time: an unresolved submission from this or another tab blocks a new one.
+    const unresolved = listPending(pilots, lanes);
+    if (unresolved.length > 0) {
+      setPendingList(unresolved);
+      setSubmitState({ status: 'error', error: { code: 'unresolved_submission', message: UNRESOLVED_MESSAGE } });
+      return;
+    }
     // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it).
     if (!canSubmit || !selectedLane || effectiveCap === null) return;
     if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
@@ -537,14 +611,8 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     await send({ key: crypto.randomUUID(), pilot, lane: selectedLane.value, ack_cap_usd: effectiveCap, createdAt: Date.now() });
   }
 
-  function retryPending() {
-    if (pending && !submitting) void send(pending);
-  }
-
-  function dismissPending() {
-    storageRemove(PENDING_KEY);
-    setPending(null);
-    setSubmitState({ status: 'idle' });
+  function retryPending(record: PendingSubmission) {
+    if (inFlightRef.current === null) void send(record);
   }
 
   function dismissTracked() {
@@ -560,7 +628,6 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
 
   const submitError = submitState.status === 'error' ? submitState.error : null;
   const trackedLane = tracked ? laneOption(tracked.lane) : undefined;
-  const pendingLane = pending ? laneOption(pending.lane) : undefined;
   const pollingActive = activeId !== null && pollHalt === null;
 
   return (
@@ -619,35 +686,37 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           </button>
         </section>
 
-        {pending && (
-          <section aria-label="Unresolved submission" className="v4s-pending">
-            <h2 className="v4s-label">Submission with an unknown outcome</h2>
-            <p className="v4s-message">
-              {pilotLabel(pending.pilot)} · {pendingLane ? `${pendingLane.provider} · ${pendingLane.model}` : pending.lane} ·
-              reservation cap ${pending.ack_cap_usd} · first sent {new Date(pending.createdAt).toLocaleString()}
-            </p>
-            <p className="v4s-muted">
-              The backend may already have accepted it. Retrying sends the same request key and body, so the backend returns
-              the existing run instead of starting a second one. Dismissing discards it in this browser only; a run the
-              backend accepted keeps going.
-            </p>
-            <div className="v4s-actions">
-              <button className="v4s-link" disabled={submitting} onClick={retryPending} type="button">
-                {submitting ? 'Retrying…' : 'Retry the same submission'}
-              </button>
-              <button className="v4s-link" disabled={submitting} onClick={dismissPending} type="button">
-                Dismiss
-              </button>
-            </div>
-          </section>
-        )}
+        {visiblePending.map((record) => {
+          const recordLane = laneOption(record.lane);
+          return (
+            <section aria-label="Unresolved submission" className="v4s-pending" data-key={record.key} key={record.key}>
+              <h2 className="v4s-label">Submission with an unknown outcome</h2>
+              <p className="v4s-message">
+                {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.model}` : record.lane} ·
+                reservation cap ${record.ack_cap_usd} · first sent {new Date(record.createdAt).toLocaleString()}
+              </p>
+              <p className="v4s-muted">
+                The backend may already have accepted it. It stays here until it resolves, and new runs are blocked from this
+                browser until then. Retrying sends the same request key and body, so the backend returns the existing run
+                instead of starting a second one.
+              </p>
+              <div className="v4s-actions">
+                <button className="v4s-link" disabled={submitting} onClick={() => retryPending(record)} type="button">
+                  Retry the same submission
+                </button>
+              </div>
+            </section>
+          );
+        })}
 
         <form className="v4s-form" onSubmit={submit}>
           <label className="v4s-field" htmlFor="v4s-pilot">
             <span className="v4s-label">Pilot</span>
             <select
+              disabled={locked}
               id="v4s-pilot"
               onChange={(event) => {
+                if (locked || inFlightRef.current !== null) return;
                 setPilot(event.target.value as PilotValue | '');
                 setSubmitState({ status: 'idle' });
               }}
@@ -671,8 +740,10 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
                 <label className="v4s-lane" key={option.value}>
                   <input
                     checked={lane === option.value}
+                    disabled={locked}
                     name="lane"
                     onChange={() => {
+                      if (locked || inFlightRef.current !== null) return;
                       setLane(option.value);
                       setAcknowledged(false);
                       setSubmitState({ status: 'idle' });
@@ -722,8 +793,10 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           <label className="v4s-ack">
             <input
               checked={acknowledged}
-              disabled={effectiveCap === null}
-              onChange={(event) => setAcknowledged(event.target.checked)}
+              disabled={effectiveCap === null || locked}
+              onChange={(event) => {
+                if (!locked) setAcknowledged(event.target.checked);
+              }}
               type="checkbox"
             />
             <span>
@@ -738,7 +811,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           </button>
 
           {storageOk === false && <p className="notice error">{STORAGE_REQUIRED_MESSAGE}</p>}
-          {pending !== null && <p className="v4s-muted">Retry or dismiss the earlier submission first.</p>}
+          {visiblePending.length > 0 && <p className="v4s-muted">Retry the earlier submission first; new runs are blocked until it resolves.</p>}
           {activeId !== null && <p className="v4s-muted">A run is being tracked below; submit again when it has finished.</p>}
 
           {submitError && (
