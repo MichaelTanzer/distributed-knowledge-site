@@ -66,7 +66,12 @@ export async function POST(request: NextRequest) {
 
   const config = await backendRequest(BACKEND_PATHS.config, { method: 'GET', clientIp });
   if (config.kind !== 'ok') return errorResponse(mapBackendFailure(config, 'config'));
-  const recipient = normalizeConfig(config.json).recipient;
+  let recipient: string | null = null;
+  try {
+    recipient = normalizeConfig(config.json).recipient;
+  } catch {
+    recipient = null;
+  }
   if (!recipient) {
     return apiError(503, 'recipient_unavailable', 'The staging backend did not report an allowlisted recipient.');
   }
@@ -79,7 +84,12 @@ export async function POST(request: NextRequest) {
   });
   if (result.kind !== 'ok') return errorResponse(mapBackendFailure(result, 'submit'));
 
-  const accepted = normalizeAccepted(result.json);
+  let accepted: ReturnType<typeof normalizeAccepted> = null;
+  try {
+    accepted = normalizeAccepted(result.json);
+  } catch {
+    accepted = null;
+  }
   if (!accepted) {
     return apiError(502, 'backend_error', 'The staging backend answered, but the response could not be read. Check the status before resubmitting.');
   }

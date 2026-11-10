@@ -31,7 +31,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const result = await backendRequest(BACKEND_PATHS.request(id), { method: 'GET', clientIp: clientIpFrom(request) });
   if (result.kind !== 'ok') return errorResponse(mapBackendFailure(result, 'status'));
 
-  const status = normalizeStatus(result.json, id);
+  let status: ReturnType<typeof normalizeStatus> = null;
+  try {
+    status = normalizeStatus(result.json, id);
+  } catch {
+    status = null;
+  }
   if (!status) return apiError(502, 'backend_error', 'The staging backend status could not be read.');
   return jsonResponse(200, status);
 }

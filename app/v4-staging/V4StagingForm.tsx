@@ -13,17 +13,22 @@ import type {
   SubmitAcceptedView
 } from '../../lib/v4Staging';
 
+/** Last tracked request id (resumes polling after a reload). */
 const STORAGE_KEY = 'dkV4Staging.lastRequestId';
+/** Submission whose outcome is not yet known: {key, pilot, lane, ack_cap_usd, createdAt}. */
+const PENDING_KEY = 'dkV4Staging.pendingSubmission';
 const POLL_INTERVAL_MS = 30_000;
+const POLL_TIMEOUT_MS = 15_000;
+const MAX_POLL_FAILURES = 10;
+const MAX_POLL_WINDOW_MS = 3 * 60 * 60 * 1000;
 const TERMINAL_STATES: ReadonlySet<RequestState> = new Set<RequestState>(['delivered', 'failed', 'interrupted']);
-/** Outcomes where the backend may or may not have accepted the request. */
-const INDETERMINATE_CODES: ReadonlySet<string> = new Set([
-  'network_error',
-  'unexpected_response',
-  'backend_error',
-  'backend_timeout',
-  'backend_unavailable'
-]);
+/** Automatic polling stops at these states: terminal, or waiting for an operator. */
+const STOP_STATES: ReadonlySet<RequestState> = new Set<RequestState>([...TERMINAL_STATES, 'interrupted_unreconciled']);
+/** Refusals that depend on the idempotency key itself: the pending submission is kept. */
+const KEY_DEPENDENT_CODES: ReadonlySet<string> = new Set(['invalid_idempotency_key', 'idempotency_conflict']);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const STORAGE_REQUIRED_MESSAGE = "Can't save submission state in this browser; enable site storage to start a paid run.";
+const ACK_PATTERN = /^\d{1,4}\.\d{2}$/;
 
 const STATE_LABELS: Record<RequestState, string> = {
   queued: 'Queued',
@@ -42,6 +47,16 @@ type ConfigState =
 
 type SubmitState = { status: 'idle' } | { status: 'submitting' } | { status: 'error'; error: ApiErrorView };
 
+type PollOutcome = 'ok' | 'error' | 'gone' | 'skipped';
+
+interface PendingSubmission {
+  key: string;
+  pilot: PilotValue;
+  lane: LaneValue;
+  ack_cap_usd: string;
+  createdAt: number;
+}
+
 interface TrackedRequest {
   requestId: string;
   state: RequestState;
@@ -57,7 +72,7 @@ interface TrackedRequest {
   checkedAt: number | null;
   pollError: string | null;
   note: string | null;
-  /** True when polling must stop for a reason other than a terminal state. */
+  /** True when polling must stop for a reason other than the state (backend no longer knows the id). */
   stopped: boolean;
 }
 
@@ -67,33 +82,98 @@ interface Props {
   requestIdPattern: string;
 }
 
-function readStoredId(pattern: RegExp): string | null {
+function storageGet(key: string): string | null {
   try {
-    const value = window.localStorage.getItem(STORAGE_KEY);
-    return value && pattern.test(value) ? value : null;
+    return window.localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function storeId(requestId: string) {
+function storageSet(key: string, value: string): void {
   try {
-    window.localStorage.setItem(STORAGE_KEY, requestId);
+    window.localStorage.setItem(key, value);
   } catch {
-    // Storage unavailable (private mode, blocked site data): polling still works until reload.
+    // Storage unavailable (private mode, blocked site data): kept in memory for this page only.
   }
 }
 
-function clearStoredId() {
+function storageRemove(key: string): void {
   try {
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(key);
   } catch {
     // Nothing stored or storage unavailable.
   }
 }
 
+/** True when localStorage accepts a write that reads back unchanged. */
+function storageWritable(): boolean {
+  try {
+    const probe = 'dkV4Staging.probe';
+    window.localStorage.setItem(probe, '1');
+    const ok = window.localStorage.getItem(probe) === '1';
+    window.localStorage.removeItem(probe);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Saves the pending submission (key bound to its exact body) and confirms it reads back. A paid
+ * submission is only dispatched when this returns true, so its key can always be recovered.
+ */
+function persistPending(submission: PendingSubmission): boolean {
+  const serialized = JSON.stringify(submission);
+  try {
+    window.localStorage.setItem(PENDING_KEY, serialized);
+    return window.localStorage.getItem(PENDING_KEY) === serialized;
+  } catch {
+    return false;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
+  const raw = storageGet(PENDING_KEY);
+  if (!raw) return null;
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+  if (isRecord(parsed)) {
+    const { key, pilot, lane, ack_cap_usd: ack, createdAt } = parsed;
+    const pilotOk = pilots.find((option) => option.value === pilot);
+    const laneOk = lanes.find((option) => option.value === lane);
+    if (
+      typeof key === 'string' &&
+      UUID_PATTERN.test(key) &&
+      pilotOk &&
+      laneOk &&
+      typeof ack === 'string' &&
+      ACK_PATTERN.test(ack) &&
+      typeof createdAt === 'number' &&
+      Number.isFinite(createdAt)
+    ) {
+      return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt };
+    }
+  }
+  storageRemove(PENDING_KEY);
+  return null;
+}
+
+/** 15 s abort for one fetch; falls back to a timer where AbortSignal.timeout is missing. */
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') return AbortSignal.timeout(ms);
+  if (typeof AbortController === 'undefined') return undefined;
+  const controller = new AbortController();
+  window.setTimeout(() => controller.abort(), ms);
+  return controller.signal;
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -114,6 +194,11 @@ function asApiError(payload: unknown, fallback: string): ApiErrorView {
   return { code: 'unexpected_response', message: fallback };
 }
 
+/** A 4xx from the staging routes that settles the submission without depending on its key. */
+function isDefinitiveRefusal(status: number, error: ApiErrorView): boolean {
+  return status >= 400 && status < 500 && error.code !== 'unexpected_response' && !KEY_DEPENDENT_CODES.has(error.code);
+}
+
 function isConfigView(payload: unknown): payload is StagingConfigView {
   return isRecord(payload) && typeof payload.spendState === 'string' && isRecord(payload.laneCapsUsd);
 }
@@ -124,6 +209,12 @@ function isAcceptedView(payload: unknown, pattern: RegExp): payload is SubmitAcc
 
 function isStatusView(payload: unknown): payload is RequestStatusView {
   return isRecord(payload) && typeof payload.requestId === 'string' && typeof payload.state === 'string';
+}
+
+function parseTime(value: string | null): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function newTracked(requestId: string, fields: Partial<TrackedRequest> = {}): TrackedRequest {
@@ -165,10 +256,21 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const [lane, setLane] = useState<LaneValue | ''>('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitState, setSubmitState] = useState<SubmitState>({ status: 'idle' });
+  const [pending, setPending] = useState<PendingSubmission | null>(null);
+  /** null until checked on mount; false blocks paid submissions (their key could not be recovered). */
+  const [storageOk, setStorageOk] = useState<boolean | null>(null);
   const [tracked, setTracked] = useState<TrackedRequest | null>(null);
+  const [pollHalt, setPollHalt] = useState<'errors' | 'time' | null>(null);
+  const [pollFailures, setPollFailures] = useState(0);
   const pollImmediatelyRef = useRef(false);
-  /** Key reused only when the previous attempt for the same selection had an unknown outcome. */
-  const retryKeyRef = useRef<{ key: string; signature: string } | null>(null);
+  const pollInFlightRef = useRef(false);
+  const pollFailuresRef = useRef(0);
+  /** Start of the 3 h automatic-polling window: admission time if known, else tracking start or last resume. */
+  const pollWindowRef = useRef<{ localStart: number; admittedMs: number | null; resumed: boolean }>({
+    localStart: 0,
+    admittedMs: null,
+    resumed: false
+  });
 
   const pilotLabel = useCallback(
     (value: PilotValue | null) => pilots.find((option) => option.value === value)?.label ?? '—',
@@ -194,16 +296,21 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     }
   }, []);
 
-  const pollStatus = useCallback(async (requestId: string) => {
+  /** One status check, aborted after 15 s; never runs two at once. */
+  const pollStatus = useCallback(async (requestId: string): Promise<PollOutcome> => {
+    if (pollInFlightRef.current) return 'skipped';
+    pollInFlightRef.current = true;
     const update = (fields: Partial<TrackedRequest>) =>
       setTracked((previous) => (previous && previous.requestId === requestId ? { ...previous, ...fields } : previous));
     try {
       const response = await fetch(`/api/v4/requests/${encodeURIComponent(requestId)}`, {
         cache: 'no-store',
-        headers: { accept: 'application/json' }
+        headers: { accept: 'application/json' },
+        signal: timeoutSignal(POLL_TIMEOUT_MS)
       });
       const payload = await readJson(response);
       if (response.ok && isStatusView(payload)) {
+        pollWindowRef.current.admittedMs = parseTime(payload.admittedAt) ?? pollWindowRef.current.admittedMs;
         update({
           state: payload.state,
           pilot: payload.pilot,
@@ -218,51 +325,108 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           checkedAt: Date.now(),
           pollError: null
         });
-        return;
+        return 'ok';
       }
       const error = asApiError(payload, `Status check failed (HTTP ${response.status}).`);
       if (response.status === 404 && error.code === 'not_found') {
-        clearStoredId();
+        storageRemove(STORAGE_KEY);
         update({ checkedAt: Date.now(), pollError: error.message, stopped: true });
-        return;
+        return 'gone';
       }
-      update({ checkedAt: Date.now(), pollError: `${error.message} Retrying every 30 s.` });
-    } catch {
-      update({ checkedAt: Date.now(), pollError: 'Status check failed (network error). Retrying every 30 s.' });
+      update({ checkedAt: Date.now(), pollError: error.message });
+      return 'error';
+    } catch (error) {
+      const timedOut = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      update({
+        checkedAt: Date.now(),
+        pollError: timedOut ? 'Status check timed out after 15 s.' : 'Status check failed (network error).'
+      });
+      return 'error';
+    } finally {
+      pollInFlightRef.current = false;
     }
   }, []);
 
-  const startTracking = useCallback((requestId: string, fields: Partial<TrackedRequest>, pollNow: boolean) => {
-    storeId(requestId);
-    pollImmediatelyRef.current = pollNow;
-    setTracked(newTracked(requestId, fields));
+  const resetPolling = useCallback((resumed: boolean) => {
+    pollFailuresRef.current = 0;
+    setPollFailures(0);
+    pollWindowRef.current = {
+      localStart: Date.now(),
+      admittedMs: resumed ? pollWindowRef.current.admittedMs : null,
+      resumed
+    };
+    setPollHalt(null);
   }, []);
 
-  // First load: configuration, and resume a request remembered by this browser.
+  const startTracking = useCallback(
+    (requestId: string, fields: Partial<TrackedRequest>, pollNow: boolean) => {
+      storageSet(STORAGE_KEY, requestId);
+      pollImmediatelyRef.current = pollNow;
+      resetPolling(false);
+      setTracked(newTracked(requestId, fields));
+    },
+    [resetPolling]
+  );
+
+  // First load: configuration, a request remembered by this browser, and any unresolved submission.
   useEffect(() => {
     void loadConfig();
-    const stored = readStoredId(idPattern);
-    if (stored) {
+    const stored = storageGet(STORAGE_KEY);
+    if (stored && idPattern.test(stored)) {
       pollImmediatelyRef.current = true;
+      resetPolling(false);
       setTracked(newTracked(stored, { note: 'Resumed from the last request made in this browser.' }));
+    } else if (stored) {
+      storageRemove(STORAGE_KEY);
     }
-  }, [idPattern, loadConfig]);
+    setPending(readPending(pilots, lanes));
+    setStorageOk(storageWritable());
+  }, [idPattern, lanes, loadConfig, pilots, resetPolling]);
 
-  const activeId = tracked && !tracked.stopped && !TERMINAL_STATES.has(tracked.state) ? tracked.requestId : null;
+  const activeId = tracked && !tracked.stopped && !STOP_STATES.has(tracked.state) ? tracked.requestId : null;
 
-  // Poll every 30 s while the tracked request is not finished.
+  // Automatic polling: the next check is scheduled only after the previous one finished. Stops after
+  // MAX_POLL_FAILURES consecutive failures or MAX_POLL_WINDOW_MS after admission, whichever comes first.
   useEffect(() => {
-    if (!activeId) return;
+    if (!activeId || pollHalt !== null) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      const outcome = await pollStatus(activeId);
+      if (cancelled || outcome === 'gone') return;
+      if (outcome === 'error') {
+        pollFailuresRef.current += 1;
+        setPollFailures(pollFailuresRef.current);
+      } else if (outcome === 'ok') {
+        pollFailuresRef.current = 0;
+        setPollFailures(0);
+      }
+      if (pollFailuresRef.current >= MAX_POLL_FAILURES) {
+        setPollHalt('errors');
+        return;
+      }
+      const window_ = pollWindowRef.current;
+      const base = !window_.resumed && window_.admittedMs !== null ? window_.admittedMs : window_.localStart;
+      if (Date.now() >= base + MAX_POLL_WINDOW_MS) {
+        setPollHalt('time');
+        return;
+      }
+      timer = window.setTimeout(() => void tick(), POLL_INTERVAL_MS);
+    };
     if (pollImmediatelyRef.current) {
       pollImmediatelyRef.current = false;
-      void pollStatus(activeId);
+      void tick();
+    } else {
+      timer = window.setTimeout(() => void tick(), POLL_INTERVAL_MS);
     }
-    const handle = window.setInterval(() => void pollStatus(activeId), POLL_INTERVAL_MS);
-    return () => window.clearInterval(handle);
-  }, [activeId, pollStatus]);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeId, pollHalt, pollStatus]);
 
-  // Refresh the budget once a run reaches a final state.
-  const finishedId = tracked && TERMINAL_STATES.has(tracked.state) ? tracked.requestId : null;
+  // Refresh the budget once a run stops (terminal or waiting for reconciliation).
+  const finishedId = tracked && STOP_STATES.has(tracked.state) ? tracked.requestId : null;
   useEffect(() => {
     if (finishedId) void loadConfig();
   }, [finishedId, loadConfig]);
@@ -276,6 +440,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const backendBusy = config?.runInProgress === true;
   const overDaily =
     effectiveCap !== null && config?.dailyRemainingUsd != null && Number(effectiveCap) > Number(config.dailyRemainingUsd);
+  const submitting = submitState.status === 'submitting';
 
   const canSubmit =
     config !== null &&
@@ -287,25 +452,23 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     selectedLane !== undefined &&
     effectiveCap !== null &&
     acknowledged &&
-    submitState.status !== 'submitting' &&
+    !submitting &&
+    storageOk === true &&
+    pending === null &&
     activeId === null;
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it).
-    if (!canSubmit || !selectedLane || effectiveCap === null) return;
-
-    const signature = `${pilot}|${selectedLane.value}|${effectiveCap}`;
-    let key: string;
-    if (retryKeyRef.current && retryKeyRef.current.signature === signature) {
-      key = retryKeyRef.current.key;
-    } else if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      key = crypto.randomUUID();
-    } else {
-      setSubmitState({ status: 'error', error: { code: 'no_uuid', message: 'This browser cannot generate a request key.' } });
+  /**
+   * Sends one submission. Its key and exact body are persisted (and read back) before the request
+   * leaves; if that fails nothing is sent. It is cleared only when it resolves: 202 / 200 replay, or
+   * a definitive 4xx that does not depend on the key, or when the user explicitly dismisses it.
+   */
+  async function send(submission: PendingSubmission) {
+    if (!persistPending(submission)) {
+      setStorageOk(false);
+      setSubmitState({ status: 'error', error: { code: 'storage_unavailable', message: STORAGE_REQUIRED_MESSAGE } });
       return;
     }
-    retryKeyRef.current = { key, signature };
+    setPending(submission);
     setSubmitState({ status: 'submitting' });
 
     let response: Response;
@@ -313,30 +476,35 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
       response = await fetch('/api/v4/requests', {
         method: 'POST',
         cache: 'no-store',
-        headers: { accept: 'application/json', 'content-type': 'application/json', 'idempotency-key': key },
-        body: JSON.stringify({ pilot, lane: selectedLane.value, ack_cap_usd: effectiveCap })
+        headers: { accept: 'application/json', 'content-type': 'application/json', 'idempotency-key': submission.key },
+        body: JSON.stringify({ pilot: submission.pilot, lane: submission.lane, ack_cap_usd: submission.ack_cap_usd })
       });
     } catch {
       setSubmitState({
         status: 'error',
         error: {
           code: 'network_error',
-          message: 'Network error: the outcome is unknown. Submitting the same selection again reuses the same request key, so it cannot start a second run.'
+          message:
+            'Network error: the outcome is unknown. Use “Retry the same submission”: it reuses the same request key, so the backend cannot start a second run for it.'
         }
       });
       return;
     }
 
     const payload = await readJson(response);
+    const resolve = () => {
+      storageRemove(PENDING_KEY);
+      setPending(null);
+    };
     if ((response.status === 202 || response.status === 200) && isAcceptedView(payload, idPattern)) {
-      retryKeyRef.current = null;
+      resolve();
       startTracking(
         payload.requestId,
         {
           state: payload.state,
-          pilot,
-          lane: selectedLane.value,
-          capUsd: payload.capUsd ?? effectiveCap,
+          pilot: submission.pilot,
+          lane: submission.lane,
+          capUsd: payload.capUsd ?? submission.ack_cap_usd,
           note: payload.replay ? 'The backend recognised this as a replay of your earlier submission.' : null
         },
         false
@@ -347,23 +515,53 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
       return;
     }
 
-    const error = asApiError(payload, `The request failed (HTTP ${response.status}). Check the status before resubmitting.`);
-    if (!INDETERMINATE_CODES.has(error.code)) retryKeyRef.current = null;
+    const error = asApiError(payload, `The request failed (HTTP ${response.status}). The outcome is unknown; retry the same submission.`);
     if (error.code === 'duplicate' && error.requestId && idPattern.test(error.requestId)) {
-      startTracking(error.requestId, { pilot, lane: selectedLane.value, note: error.message }, true);
+      resolve();
+      startTracking(error.requestId, { pilot: submission.pilot, lane: submission.lane, note: error.message }, true);
       setSubmitState({ status: 'idle' });
       return;
     }
+    if (isDefinitiveRefusal(response.status, error)) resolve();
     setSubmitState({ status: 'error', error });
   }
 
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it).
+    if (!canSubmit || !selectedLane || effectiveCap === null) return;
+    if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+      setSubmitState({ status: 'error', error: { code: 'no_uuid', message: 'This browser cannot generate a request key.' } });
+      return;
+    }
+    await send({ key: crypto.randomUUID(), pilot, lane: selectedLane.value, ack_cap_usd: effectiveCap, createdAt: Date.now() });
+  }
+
+  function retryPending() {
+    if (pending && !submitting) void send(pending);
+  }
+
+  function dismissPending() {
+    storageRemove(PENDING_KEY);
+    setPending(null);
+    setSubmitState({ status: 'idle' });
+  }
+
   function dismissTracked() {
-    clearStoredId();
+    storageRemove(STORAGE_KEY);
     setTracked(null);
+    setPollHalt(null);
+  }
+
+  function resumePolling() {
+    pollImmediatelyRef.current = true;
+    resetPolling(true);
   }
 
   const submitError = submitState.status === 'error' ? submitState.error : null;
   const trackedLane = tracked ? laneOption(tracked.lane) : undefined;
+  const pendingLane = pending ? laneOption(pending.lane) : undefined;
+  const pollingActive = activeId !== null && pollHalt === null;
 
   return (
     <main className="generate-shell">
@@ -421,6 +619,29 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           </button>
         </section>
 
+        {pending && (
+          <section aria-label="Unresolved submission" className="v4s-pending">
+            <h2 className="v4s-label">Submission with an unknown outcome</h2>
+            <p className="v4s-message">
+              {pilotLabel(pending.pilot)} · {pendingLane ? `${pendingLane.provider} · ${pendingLane.model}` : pending.lane} ·
+              reservation cap ${pending.ack_cap_usd} · first sent {new Date(pending.createdAt).toLocaleString()}
+            </p>
+            <p className="v4s-muted">
+              The backend may already have accepted it. Retrying sends the same request key and body, so the backend returns
+              the existing run instead of starting a second one. Dismissing discards it in this browser only; a run the
+              backend accepted keeps going.
+            </p>
+            <div className="v4s-actions">
+              <button className="v4s-link" disabled={submitting} onClick={retryPending} type="button">
+                {submitting ? 'Retrying…' : 'Retry the same submission'}
+              </button>
+              <button className="v4s-link" disabled={submitting} onClick={dismissPending} type="button">
+                Dismiss
+              </button>
+            </div>
+          </section>
+        )}
+
         <form className="v4s-form" onSubmit={submit}>
           <label className="v4s-field" htmlFor="v4s-pilot">
             <span className="v4s-label">Pilot</span>
@@ -465,10 +686,13 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
                       {option.provider} · {option.model}
                     </span>
                     <span className="v4s-lane-meta">
-                      Spends up to ${cap} (worst case, reserved before each call) · typical runtime {option.typicalRuntime}
+                      Reservation cap ${cap} per run (worst case per call, reserved before calls are made) · typical runtime{' '}
+                      {option.typicalRuntime}
                     </span>
                     {cap !== option.capUsd && (
-                      <span className="v4s-lane-meta v4s-warn">Backend cap differs from the expected ${option.capUsd}.</span>
+                      <span className="v4s-lane-meta v4s-warn">
+                        Backend reservation cap differs from the expected ${option.capUsd}.
+                      </span>
                     )}
                   </span>
                 </label>
@@ -490,7 +714,8 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
 
           {overDaily && (
             <p className="notice error">
-              This lane&apos;s cap is above today&apos;s remaining budget, so the backend will probably refuse it until 00:00 UTC.
+              This lane&apos;s reservation cap is above today&apos;s remaining budget, so the backend will probably refuse
+              it until 00:00 UTC.
             </p>
           )}
 
@@ -503,15 +728,17 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
             />
             <span>
               {effectiveCap === null
-                ? 'Select a lane to see its cap.'
-                : `I understand this run spends up to $${effectiveCap} of metered API budget (worst case, reserved before each call).`}
+                ? 'Select a lane to see its reservation cap.'
+                : `I understand that this run reserves up to $${effectiveCap} of metered API budget before calls are made (worst case per call), and that actual billed usage can exceed the reservation in rare cases.`}
             </span>
           </label>
 
           <button className="v4s-submit" disabled={!canSubmit} type="submit">
-            {submitState.status === 'submitting' ? 'Submitting…' : 'Start run'}
+            {submitting ? 'Submitting…' : 'Start run'}
           </button>
 
+          {storageOk === false && <p className="notice error">{STORAGE_REQUIRED_MESSAGE}</p>}
+          {pending !== null && <p className="v4s-muted">Retry or dismiss the earlier submission first.</p>}
           {activeId !== null && <p className="v4s-muted">A run is being tracked below; submit again when it has finished.</p>}
 
           {submitError && (
@@ -536,8 +763,9 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           )}
 
           <p className="v4s-muted v4s-footnote">
-            Caps are enforced on worst-case reservations made before each provider call. Settlement uses actual usage, so a
-            day can end slightly above the daily ceiling; further runs are then refused.
+            Reservation caps are enforced on worst-case reservations made before each provider call; they are not a hard
+            maximum. Settlement uses actual usage, so in rare cases a run can bill more than its reservation cap and a day can
+            end slightly above the daily ceiling; further runs are then refused.
           </p>
         </form>
 
@@ -570,7 +798,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
                 <dt>Committed</dt>
                 <dd>
                   {money(tracked.committedUsd)}
-                  {tracked.capUsd !== null && <> (cap {money(tracked.capUsd)})</>}
+                  {tracked.capUsd !== null && <> (reservation cap {money(tracked.capUsd)})</>}
                 </dd>
               </div>
               {tracked.reservedUsd !== null && activeId !== null && (
@@ -605,21 +833,42 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
                 <dt>Last checked</dt>
                 <dd>
                   {tracked.checkedAt ? new Date(tracked.checkedAt).toLocaleTimeString() : 'not yet'}
-                  {activeId !== null && ' · checks every 30 s'}
+                  {pollingActive && ' · checks every 30 s'}
                 </dd>
               </div>
             </dl>
             {tracked.state === 'running' && trackedLane && (
               <p className="v4s-muted">Typical runtime for this lane: {trackedLane.typicalRuntime}.</p>
             )}
-            {tracked.pollError && <p className="notice error">{tracked.pollError}</p>}
+            {tracked.state === 'interrupted_unreconciled' && (
+              <p className="notice error">Needs operator reconciliation; no further runs can start until it is resolved.</p>
+            )}
+            {tracked.pollError && (
+              <p className="notice error">
+                {tracked.pollError}
+                {pollingActive && pollFailures > 0 && ` Retrying in 30 s (failure ${pollFailures} of ${MAX_POLL_FAILURES}).`}
+              </p>
+            )}
+            {pollHalt === 'errors' && (
+              <p className="notice error">
+                Automatic status checks stopped after {MAX_POLL_FAILURES} failed checks in a row.
+              </p>
+            )}
+            {pollHalt === 'time' && (
+              <p className="notice error">Automatic status checks stopped 3 hours after the request was admitted.</p>
+            )}
             <div className="v4s-actions">
-              {activeId !== null && (
+              {activeId !== null && pollHalt !== null && (
+                <button className="v4s-link" onClick={resumePolling} type="button">
+                  Resume status checks
+                </button>
+              )}
+              {(pollingActive || tracked.state === 'interrupted_unreconciled') && (
                 <button className="v4s-link" onClick={() => void pollStatus(tracked.requestId)} type="button">
                   Check now
                 </button>
               )}
-              {activeId === null && (
+              {!pollingActive && (
                 <button className="v4s-link" onClick={dismissTracked} type="button">
                   Dismiss
                 </button>

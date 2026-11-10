@@ -26,7 +26,11 @@ export async function GET(request: NextRequest) {
 
   const result = await backendRequest(BACKEND_PATHS.config, { method: 'GET', clientIp: clientIpFrom(request) });
   if (result.kind !== 'ok') return errorResponse(mapBackendFailure(result, 'config'));
-  return jsonResponse(200, normalizeConfig(result.json));
+  try {
+    return jsonResponse(200, normalizeConfig(result.json));
+  } catch {
+    return apiError(502, 'backend_error', 'The staging backend configuration could not be read.');
+  }
 }
 
 export function POST() {

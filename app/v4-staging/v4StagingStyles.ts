@@ -38,6 +38,7 @@ export const V4_STAGING_CSS = `
   color: var(--muted);
 }
 .v4s-budget,
+.v4s-pending,
 .v4s-status {
   display: grid;
   gap: 10px;
@@ -125,6 +126,7 @@ export const V4_STAGING_CSS = `
 .v4s-link:disabled { opacity: .55; cursor: not-allowed; }
 .v4s-warn { color: #ffd9a0; font-weight: 400; }
 .v4s-message { margin: 0; }
+.v4s-pending { border-color: rgba(255, 217, 160, 0.55); }
 .v4s-message + .v4s-message { margin-top: 4px; }
 .v4s-footnote { font-size: 11px; }
 .v4s-actions { display: flex; gap: 10px; flex-wrap: wrap; }

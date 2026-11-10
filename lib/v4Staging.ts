@@ -30,7 +30,11 @@ export interface LaneOption {
   value: LaneValue;
   provider: string;
   model: string;
-  /** Per-request cap in USD, two decimals, exactly as sent in `ack_cap_usd`. */
+  /**
+   * Per-request reservation cap in USD (two decimals, exactly as sent in
+   * `ack_cap_usd`). Enforced on worst-case reservations before each call; it is
+   * not a hard maximum on billed usage.
+   */
   capUsd: string;
   typicalRuntime: string;
 }
@@ -280,9 +284,13 @@ function shortCode(value: unknown): string | null {
   return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(value) ? value : null;
 }
 
+/** ISO-like string passed through; epoch seconds converted only when the Date is valid (never throws). */
 function timestamp(value: unknown): string | null {
   if (typeof value === 'string' && /^[0-9T:.+\-Z ]{4,40}$/.test(value)) return value;
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return new Date(value * 1000).toISOString();
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    const date = new Date(value * 1000);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
   return null;
 }
 
@@ -407,7 +415,7 @@ const KNOWN_ERROR_FALLBACK: Record<KnownErrorCode, string> = {
   run_in_progress: 'Another staging run is in progress. Wait for it to finish.',
   duplicate: 'This request was already submitted.',
   idempotency_conflict: 'This submission key was already used for a different request. Submit again.',
-  cap_ack_mismatch: 'The acknowledged cap does not match the backend cap for this lane.',
+  cap_ack_mismatch: "The acknowledged reservation cap does not match the backend's reservation cap for this lane.",
   spend_disabled: 'New runs are paused (staging admission is disabled). A run already in progress keeps going until it finishes or times out.',
   staging_budget_exhausted: 'The overall staging budget is exhausted.',
   reconciliation_required: 'An earlier run needs operator reconciliation; no new runs are accepted until then.',
@@ -483,7 +491,7 @@ export function mapBackendFailure(result: Exclude<BackendResult, { kind: 'ok' }>
   if (isKnownErrorCode(code)) {
     let fallback = KNOWN_ERROR_FALLBACK[code];
     const backendCap = usd(pick(source, f.capUsd));
-    if (code === 'cap_ack_mismatch' && backendCap) fallback = `${fallback} The backend cap is $${backendCap}; reload the page and try again.`;
+    if (code === 'cap_ack_mismatch' && backendCap) fallback = `${fallback} The backend reservation cap is $${backendCap}; reload the page and try again.`;
     const body: ApiErrorView = { code, message: safeBackendMessage(pick(source, f.message)) ?? fallback };
     const seconds = retryAfter(pick(source, f.retryAfterSeconds));
     if (seconds !== undefined) body.retryAfterSeconds = seconds;
@@ -596,16 +604,16 @@ function firstHeaderValue(request: Request, name: string): string | null {
 }
 
 /**
- * POST same-origin check: `Origin` must be present and equal to this
- * request's own origin, and `Sec-Fetch-Site`, if sent, must be `same-origin`.
- * The own origin is the parsed request URL, or scheme + forwarded host / Host
- * header (both are set by the browser or the platform, never by page script).
+ * POST same-origin check: `Sec-Fetch-Site` must be exactly `same-origin` (a
+ * missing header is refused) and `Origin` must be present and equal to this
+ * request's own origin. The own origin is the parsed request URL, or scheme +
+ * forwarded host / Host header (set by the browser or the platform, never by
+ * page script).
  */
 export function isSameOriginPost(request: Request & { nextUrl?: URL }): boolean {
+  if (request.headers.get('sec-fetch-site') !== 'same-origin') return false;
   const origin = request.headers.get('origin');
   if (!origin) return false;
-  const fetchSite = request.headers.get('sec-fetch-site');
-  if (fetchSite !== null && fetchSite !== 'same-origin') return false;
   const own = new Set<string>();
   const parsed = request.nextUrl ?? new URL(request.url);
   own.add(parsed.origin);
