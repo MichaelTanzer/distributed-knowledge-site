@@ -22,8 +22,9 @@ const STORAGE_KEY = 'dkV4Staging.lastRequestId';
  * other tabs are never overwritten or removed.
  */
 const PENDING_PREFIX = 'dkV4Staging.pending.';
-/** Single-slot record used before repair round 2; migrated to a per-key record on load. */
-const LEGACY_PENDING_KEY = 'dkV4Staging.pendingSubmission';
+/** Added to a refusal's message when the record is kept because an earlier attempt's outcome is unknown. */
+const UNCERTAIN_KEPT_MESSAGE =
+  'An earlier attempt of this submission has an unknown outcome, so this answer does not settle it: it stays recorded and keeps blocking new runs. Use “Retry the same submission” later; only an accepted or replayed answer clears it.';
 const POLL_INTERVAL_MS = 30_000;
 const POLL_TIMEOUT_MS = 15_000;
 const MAX_POLL_FAILURES = 10;
@@ -64,6 +65,17 @@ interface PendingSubmission {
   lane: LaneValue;
   ack_cap_usd: string;
   createdAt: number;
+  /**
+   * Written as true before every fetch (the first one too) and never downgraded: a dispatch of this key
+   * may be outstanding. Only an answer received for that dispatch, in the page that sent it, can settle it.
+   */
+  uncertain: boolean;
+  /**
+   * Dispatches of this key so far, across reloads and tabs (re-read and incremented before each fetch). A
+   * definitive key-independent 4xx clears the record only when the answering dispatch was attempt 1 and the
+   * stored count is still 1; otherwise only 202 or 200 with replay: true clears it.
+   */
+  attempts: number;
 }
 
 interface TrackedRequest {
@@ -147,6 +159,47 @@ function clearRecord(key: string): void {
   storageRemove(PENDING_PREFIX + key);
 }
 
+function readRecord(key: string, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
+  return parseRecord(storageGet(PENDING_PREFIX + key), pilots, lanes);
+}
+
+/**
+ * Before every fetch: re-read the stored record (its body wins for an existing key), mark it uncertain and
+ * count this attempt. Returns the record to send and its attempt number, or null when the write or its
+ * read-back failed (then nothing may be sent).
+ */
+function beginAttempt(
+  submission: PendingSubmission,
+  pilots: PilotOption[],
+  lanes: LaneOption[]
+): { record: PendingSubmission; attempt: number } | null {
+  const stored = readRecord(submission.key, pilots, lanes);
+  const attempt = (stored?.attempts ?? 0) + 1;
+  const record: PendingSubmission = { ...(stored ?? submission), uncertain: true, attempts: attempt };
+  return persistRecord(record) ? { record, attempt } : null;
+}
+
+/** An outcome stayed unknown: re-assert the record (recreating it if needed); never downgrade flag or count. */
+function keepUncertain(submission: PendingSubmission, attempt: number, pilots: PilotOption[], lanes: LaneOption[]): void {
+  const stored = readRecord(submission.key, pilots, lanes);
+  persistRecord({ ...(stored ?? submission), uncertain: true, attempts: Math.max(stored?.attempts ?? 0, attempt) });
+}
+
+/**
+ * A definitive key-independent refusal was received for this page's dispatch. It settles the key only when
+ * that dispatch was the key's sole attempt (attempt 1, stored count still 1). Returns true when the record
+ * is gone (cleared now, or already resolved elsewhere).
+ */
+function settleIfSoleAttempt(key: string, attempt: number, pilots: PilotOption[], lanes: LaneOption[]): boolean {
+  const stored = readRecord(key, pilots, lanes);
+  if (!stored) return true;
+  if (attempt === 1 && stored.attempts === 1) {
+    clearRecord(key);
+    return true;
+  }
+  return false;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -160,7 +213,7 @@ function parseRecord(raw: string | null, pilots: PilotOption[], lanes: LaneOptio
     parsed = null;
   }
   if (isRecord(parsed)) {
-    const { key, pilot, lane, ack_cap_usd: ack, createdAt } = parsed;
+    const { key, pilot, lane, ack_cap_usd: ack, createdAt, uncertain, attempts } = parsed;
     const pilotOk = pilots.find((option) => option.value === pilot);
     const laneOk = lanes.find((option) => option.value === lane);
     if (
@@ -173,7 +226,9 @@ function parseRecord(raw: string | null, pilots: PilotOption[], lanes: LaneOptio
       typeof createdAt === 'number' &&
       Number.isFinite(createdAt)
     ) {
-      return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt };
+      // A missing or malformed flag reads as uncertain; a missing count reads as one earlier dispatch.
+      const count = typeof attempts === 'number' && Number.isInteger(attempts) && attempts >= 1 ? attempts : 1;
+      return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt, uncertain: uncertain !== false, attempts: count };
     }
   }
   return null;
@@ -197,12 +252,6 @@ function listPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmiss
     return records;
   }
   return records.sort((a, b) => a.createdAt - b.createdAt);
-}
-
-/** Moves a pre-round-2 single-slot record to its per-key record (removed only after the copy reads back). */
-function migrateLegacyRecord(pilots: PilotOption[], lanes: LaneOption[]): void {
-  const legacy = parseRecord(storageGet(LEGACY_PENDING_KEY), pilots, lanes);
-  if (legacy && persistRecord(legacy)) storageRemove(LEGACY_PENDING_KEY);
 }
 
 /** 15 s abort for one fetch; falls back to a timer where AbortSignal.timeout is missing. */
@@ -420,7 +469,6 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     } else if (stored) {
       storageRemove(STORAGE_KEY);
     }
-    migrateLegacyRecord(pilots, lanes);
     setPendingList(listPending(pilots, lanes));
     setStorageOk(storageWritable());
   }, [idPattern, lanes, loadConfig, pilots, resetPolling]);
@@ -519,19 +567,22 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
    * record is removed only when this submission resolves: 202 / 200 replay, `duplicate`, or a
    * definitive 4xx that does not depend on the key. There is no way to discard it from the UI.
    */
-  async function send(submission: PendingSubmission) {
+  async function send(original: PendingSubmission) {
     if (inFlightRef.current !== null) return;
-    if (!persistRecord(submission)) {
+    // Recorded (uncertain, attempt counted) before the request leaves; on a failed write nothing is sent.
+    const begun = beginAttempt(original, pilots, lanes);
+    if (!begun) {
       setStorageOk(false);
       setSubmitState({ status: 'error', error: { code: 'storage_unavailable', message: STORAGE_REQUIRED_MESSAGE } });
       return;
     }
+    const { record: submission, attempt } = begun;
     inFlightRef.current = submission.key;
     setInFlightKey(submission.key);
     refreshPending();
     setSubmitState({ status: 'submitting' });
     try {
-      await dispatch(submission);
+      await dispatch(submission, attempt);
     } finally {
       inFlightRef.current = null;
       setInFlightKey(null);
@@ -539,7 +590,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     }
   }
 
-  async function dispatch(submission: PendingSubmission) {
+  async function dispatch(submission: PendingSubmission, attempt: number) {
     let response: Response;
     try {
       response = await fetch('/api/v4/requests', {
@@ -549,6 +600,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
         body: JSON.stringify({ pilot: submission.pilot, lane: submission.lane, ack_cap_usd: submission.ack_cap_usd })
       });
     } catch {
+      keepUncertain(submission, attempt, pilots, lanes);
       setSubmitState({
         status: 'error',
         error: {
@@ -562,16 +614,17 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
 
     const payload = await readJson(response);
     const resolve = () => clearRecord(submission.key);
-    if ((response.status === 202 || response.status === 200) && isAcceptedView(payload, idPattern)) {
+    const accepted = isAcceptedView(payload, idPattern) ? payload : null;
+    if (accepted && (response.status === 202 || (response.status === 200 && accepted.replay === true))) {
       resolve();
       startTracking(
-        payload.requestId,
+        accepted.requestId,
         {
-          state: payload.state,
+          state: accepted.state,
           pilot: submission.pilot,
           lane: submission.lane,
-          capUsd: payload.capUsd ?? submission.ack_cap_usd,
-          note: payload.replay ? 'The backend recognised this as a replay of your earlier submission.' : null
+          capUsd: accepted.capUsd ?? submission.ack_cap_usd,
+          note: accepted.replay ? 'The backend recognised this as a replay of your earlier submission.' : null
         },
         false
       );
@@ -582,14 +635,26 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     }
 
     const error = asApiError(payload, `The request failed (HTTP ${response.status}). The outcome is unknown; retry the same submission.`);
-    if (error.code === 'duplicate' && error.requestId && idPattern.test(error.requestId)) {
-      resolve();
+    const outcomeUnknown = response.status >= 500 || error.code === 'unexpected_response' || response.ok;
+    if (outcomeUnknown) {
+      // 5xx, unreadable or unexpected answer: this dispatch's outcome is unknown too.
+      keepUncertain(submission, attempt, pilots, lanes);
+      setSubmitState({ status: 'error', error });
+      return;
+    }
+    if (error.code === 'duplicate' && error.requestId && idPattern.test(error.requestId) && settleIfSoleAttempt(submission.key, attempt, pilots, lanes)) {
       startTracking(error.requestId, { pilot: submission.pilot, lane: submission.lane, note: error.message }, true);
       setSubmitState({ status: 'idle' });
       return;
     }
-    if (isDefinitiveRefusal(response.status, error)) resolve();
-    setSubmitState({ status: 'error', error });
+    if (isDefinitiveRefusal(response.status, error) && settleIfSoleAttempt(submission.key, attempt, pilots, lanes)) {
+      // The key's only dispatch, answer received in this page: the refusal settles it.
+      setSubmitState({ status: 'error', error });
+      return;
+    }
+    // Earlier or concurrent attempts exist (or the refusal depends on the key): keep the record, keep blocking.
+    const kept = isDefinitiveRefusal(response.status, error) || attempt > 1;
+    setSubmitState({ status: 'error', error: kept ? { ...error, message: `${error.message} ${UNCERTAIN_KEPT_MESSAGE}` } : error });
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -608,7 +673,15 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
       setSubmitState({ status: 'error', error: { code: 'no_uuid', message: 'This browser cannot generate a request key.' } });
       return;
     }
-    await send({ key: crypto.randomUUID(), pilot, lane: selectedLane.value, ack_cap_usd: effectiveCap, createdAt: Date.now() });
+    await send({
+      key: crypto.randomUUID(),
+      pilot,
+      lane: selectedLane.value,
+      ack_cap_usd: effectiveCap,
+      createdAt: Date.now(),
+      uncertain: true,
+      attempts: 0
+    });
   }
 
   function retryPending(record: PendingSubmission) {
@@ -689,7 +762,13 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
         {visiblePending.map((record) => {
           const recordLane = laneOption(record.lane);
           return (
-            <section aria-label="Unresolved submission" className="v4s-pending" data-key={record.key} key={record.key}>
+            <section
+              aria-label="Unresolved submission"
+              className="v4s-pending"
+              data-attempts={record.attempts}
+              data-key={record.key}
+              key={record.key}
+            >
               <h2 className="v4s-label">Submission with an unknown outcome</h2>
               <p className="v4s-message">
                 {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.model}` : record.lane} ·
