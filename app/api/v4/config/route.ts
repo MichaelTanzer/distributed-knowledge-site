@@ -16,6 +16,8 @@ import {
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+/** One backend call bounded at 15 s. */
+export const maxDuration = 20;
 
 /** GET /api/v4/config → backend GET /v1/config, returned as a sanitised view. */
 export async function GET(request: NextRequest) {

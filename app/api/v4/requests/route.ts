@@ -21,6 +21,8 @@ import {
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+/** Two sequential backend calls (config, then submit), each bounded at 15 s. */
+export const maxDuration = 40;
 
 const MAX_BODY_BYTES = 2048;
 
