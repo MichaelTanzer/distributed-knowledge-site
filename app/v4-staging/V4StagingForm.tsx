@@ -16,12 +16,20 @@ import type {
 /** Last tracked request id (resumes polling after a reload). */
 const STORAGE_KEY = 'dkV4Staging.lastRequestId';
 /**
- * Recovery records for submissions whose outcome is not yet known, one per idempotency key:
- * `dkV4Staging.pending.<key>` = {key, pilot, lane, ack_cap_usd, createdAt}. A record is written (and
- * read back) before its POST leaves and is removed only when that submission resolves. Records of
- * other tabs are never overwritten or removed.
+ * Recovery records for submissions whose outcome is not yet known, one per idempotency key, in IndexedDB
+ * (database `dkV4Staging`, object store `pending`, out-of-line key = idempotency key, value = JSON string
+ * {key, pilot, lane, ack_cap_usd, createdAt, uncertain, attempts}). IndexedDB, not localStorage: under a
+ * Web Lock a tab granted the lock right after another tab's write can read a stale localStorage value
+ * (per-process cache), while IndexedDB transactions read committed data. Shown to people as
+ * `dkV4Staging.pending.<key>`.
  */
 const PENDING_PREFIX = 'dkV4Staging.pending.';
+const DB_NAME = 'dkV4Staging';
+const DB_VERSION = 1;
+const RECORDS_STORE = 'pending';
+const PROBE_STORE = 'probe';
+/** Cross-tab notice that the records changed (IndexedDB fires no storage event). */
+const RECORDS_CHANNEL = 'dkV4Staging.records';
 /** Added to a refusal's message when the record is kept because an earlier attempt's outcome is unknown. */
 const UNCERTAIN_KEPT_MESSAGE =
   'An earlier attempt of this submission has an unknown outcome, so this answer does not settle it: it stays recorded and keeps blocking new runs. Use “Retry the same submission” later; only an accepted or replayed answer clears it.';
@@ -142,19 +150,6 @@ function storageRemove(key: string): void {
   }
 }
 
-/** True when localStorage accepts a write that reads back unchanged. */
-function storageWritable(): boolean {
-  try {
-    const probe = 'dkV4Staging.probe';
-    window.localStorage.setItem(probe, '1');
-    const ok = window.localStorage.getItem(probe) === '1';
-    window.localStorage.removeItem(probe);
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -167,10 +162,11 @@ type SlotRead =
   | { kind: 'error' };
 
 /**
- * Strict parse: every field present and valid, uncertain === true, attempts a positive safe integer, and the
- * record's key equal to the key of the slot it was read from (otherwise the slot is malformed).
+ * Strict parse: a JSON string with every field present and valid, uncertain === true, attempts a positive
+ * safe integer, and the record's key equal to the key of the slot it was read from (otherwise malformed).
  */
-function parseRecord(raw: string, slotKey: string, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
+function parseRecord(raw: unknown, slotKey: string, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
+  if (typeof raw !== 'string') return null;
   let parsed: unknown = null;
   try {
     parsed = JSON.parse(raw);
@@ -201,68 +197,155 @@ function parseRecord(raw: string, slotKey: string, pilots: PilotOption[], lanes:
   return null;
 }
 
-function readSlot(key: string, pilots: PilotOption[], lanes: LaneOption[]): SlotRead {
-  let raw: string | null;
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function openRecordsDb(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+  const opening = new Promise<IDBDatabase>((resolve, reject) => {
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(RECORDS_STORE)) db.createObjectStore(RECORDS_STORE);
+      if (!db.objectStoreNames.contains(PROBE_STORE)) db.createObjectStore(PROBE_STORE);
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => reject(new Error('indexedDB open blocked'));
+  });
+  dbPromise = opening;
+  opening.catch(() => {
+    dbPromise = null;
+  });
+  return opening;
+}
+
+function idbRequest<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
+ * Runs `body` in one IndexedDB transaction on `storeName` and resolves after the transaction committed.
+ * `body` may only await requests of that transaction. Any error aborts the transaction and rejects.
+ */
+async function inTransaction<T>(
+  storeName: string,
+  mode: IDBTransactionMode,
+  body: (store: IDBObjectStore) => Promise<T>
+): Promise<T> {
+  const db = await openRecordsDb();
+  const tx = db.transaction(storeName, mode);
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error ?? new Error('transaction aborted'));
+    tx.onerror = () => reject(tx.error ?? new Error('transaction error'));
+  });
+  done.catch(() => undefined);
+  let value: T;
   try {
-    raw = window.localStorage.getItem(PENDING_PREFIX + key);
+    value = await body(tx.objectStore(storeName));
+  } catch (error) {
+    try {
+      tx.abort();
+    } catch {
+      // already finished
+    }
+    throw error;
+  }
+  await done;
+  return value;
+}
+
+async function readSlotIn(store: IDBObjectStore, key: string, pilots: PilotOption[], lanes: LaneOption[]): Promise<SlotRead> {
+  let raw: unknown;
+  try {
+    raw = await idbRequest(store.get(key));
   } catch {
     return { kind: 'error' };
   }
-  if (raw === null) return { kind: 'missing' };
+  if (raw === undefined) return { kind: 'missing' };
   const record = parseRecord(raw, key, pilots, lanes);
   return record ? { kind: 'ok', record } : { kind: 'malformed' };
 }
 
-/** Writes one record and confirms it reads back byte-for-byte. Call only inside the records lock. */
-function writeVerified(record: PendingSubmission): boolean {
+/** Puts one record and reads it back inside the same transaction (commit is awaited by the caller). */
+async function writeRecordIn(store: IDBObjectStore, record: PendingSubmission): Promise<boolean> {
   const serialized = JSON.stringify(record);
+  await idbRequest(store.put(serialized, record.key));
+  return (await idbRequest(store.get(record.key))) === serialized;
+}
+
+interface PendingScan {
+  records: PendingSubmission[];
+  /** Slots that are unreadable or malformed (including key/slot mismatch); they block. */
+  badSlots: string[];
+  /** True when the store itself could not be read; it blocks. */
+  error: boolean;
+}
+
+async function scanIn(store: IDBObjectStore, pilots: PilotOption[], lanes: LaneOption[]): Promise<PendingScan> {
+  const scan: PendingScan = { records: [], badSlots: [], error: false };
+  const keys = await idbRequest(store.getAllKeys());
+  const values = await idbRequest(store.getAll());
+  keys.forEach((slotKey, index) => {
+    const name = PENDING_PREFIX + String(slotKey);
+    if (typeof slotKey !== 'string') {
+      scan.badSlots.push(name);
+      return;
+    }
+    const record = parseRecord(values[index], slotKey, pilots, lanes);
+    if (record) scan.records.push(record);
+    else scan.badSlots.push(name);
+  });
+  scan.records.sort((a, b) => a.createdAt - b.createdAt);
+  return scan;
+}
+
+/** All recovery records (any tab), oldest first, plus malformed slots. Read-only; for display. */
+async function scanPending(pilots: PilotOption[], lanes: LaneOption[]): Promise<PendingScan> {
   try {
-    window.localStorage.setItem(PENDING_PREFIX + record.key, serialized);
-    return window.localStorage.getItem(PENDING_PREFIX + record.key) === serialized;
+    return await inTransaction(RECORDS_STORE, 'readonly', (store) => scanIn(store, pilots, lanes));
   } catch {
-    return false;
+    return { records: [], badSlots: [], error: true };
   }
 }
 
-function removeSlot(key: string): boolean {
+/** True when IndexedDB opens and accepts a committed write (in a separate probe store). */
+async function recordsStoreUsable(): Promise<boolean> {
   try {
-    window.localStorage.removeItem(PENDING_PREFIX + key);
+    await inTransaction(PROBE_STORE, 'readwrite', async (store) => {
+      await idbRequest(store.put(1, 'probe'));
+      await idbRequest(store.delete('probe'));
+    });
     return true;
   } catch {
     return false;
   }
 }
 
-interface PendingScan {
-  records: PendingSubmission[];
-  /** Slots under the prefix that are unreadable or malformed (including key/slot mismatch); they block. */
-  badSlots: string[];
-  /** True when storage itself could not be read; it blocks. */
-  error: boolean;
-}
-
-/** All recovery records in this browser (any tab), oldest first, plus any malformed slots. Read-only. */
-function scanPending(pilots: PilotOption[], lanes: LaneOption[]): PendingScan {
-  const scan: PendingScan = { records: [], badSlots: [], error: false };
-  const names: string[] = [];
+function notifyRecordsChanged(): void {
   try {
-    const storage = window.localStorage;
-    for (let index = 0; index < storage.length; index += 1) {
-      const name = storage.key(index);
-      if (name && name.startsWith(PENDING_PREFIX)) names.push(name);
-    }
+    const channel = new BroadcastChannel(RECORDS_CHANNEL);
+    channel.postMessage('changed');
+    channel.close();
   } catch {
-    scan.error = true;
-    return scan;
+    // No BroadcastChannel: other tabs still re-check inside the lock before any submission.
   }
-  for (const name of names) {
-    const slot = readSlot(name.slice(PENDING_PREFIX.length), pilots, lanes);
-    if (slot.kind === 'ok') scan.records.push(slot.record);
-    else if (slot.kind === 'malformed') scan.badSlots.push(name);
-    else if (slot.kind === 'error') scan.error = true;
-  }
-  scan.records.sort((a, b) => a.createdAt - b.createdAt);
-  return scan;
 }
 
 function locksSupported(): boolean {
@@ -279,7 +362,7 @@ type Locked<T> = { ok: true; value: T } | { ok: false };
  * Runs `critical` (storage operations only, never a fetch) while holding the origin-wide records lock, so
  * record mutations in all tabs are serialised. Fails closed: no Web Locks, a timeout or an error -> ok:false.
  */
-async function withRecordsLock<T>(critical: () => T): Promise<Locked<T>> {
+async function withRecordsLock<T>(critical: () => Promise<T>): Promise<Locked<T>> {
   if (!locksSupported()) return { ok: false };
   try {
     const value = (await navigator.locks.request(
@@ -301,57 +384,84 @@ type Begin =
   | { kind: 'storage' };
 
 /**
- * Inside the lock. A genuinely fresh submission: only when no unresolved, malformed or unreadable record
- * exists (checked in the same critical section) is its record written, at attempt 1.
+ * Inside the lock, one readwrite transaction. A genuinely fresh submission: only when no unresolved,
+ * malformed or unreadable record exists (checked in the same transaction) is its record written, at attempt 1.
  */
-function beginFreshLocked(fresh: PendingSubmission, pilots: PilotOption[], lanes: LaneOption[]): Begin {
-  const scan = scanPending(pilots, lanes);
-  if (scan.error) return { kind: 'storage' };
-  if (scan.records.length > 0 || scan.badSlots.length > 0) return { kind: 'unresolved', scan };
-  const slot = readSlot(fresh.key, pilots, lanes);
-  if (slot.kind === 'error') return { kind: 'storage' };
-  if (slot.kind !== 'missing') return { kind: 'malformed' };
-  const record: PendingSubmission = { ...fresh, uncertain: true, attempts: 1 };
-  return writeVerified(record) ? { kind: 'ok', record, attempt: 1 } : { kind: 'storage' };
+async function beginFreshLocked(fresh: PendingSubmission, pilots: PilotOption[], lanes: LaneOption[]): Promise<Begin> {
+  try {
+    return await inTransaction(RECORDS_STORE, 'readwrite', async (store): Promise<Begin> => {
+      const scan = await scanIn(store, pilots, lanes);
+      if (scan.records.length > 0 || scan.badSlots.length > 0) return { kind: 'unresolved', scan };
+      const slot = await readSlotIn(store, fresh.key, pilots, lanes);
+      if (slot.kind === 'error') throw new Error('read failed');
+      if (slot.kind !== 'missing') return { kind: 'malformed' };
+      const record: PendingSubmission = { ...fresh, uncertain: true, attempts: 1 };
+      if (!(await writeRecordIn(store, record))) throw new Error('read-back mismatch');
+      return { kind: 'ok', record, attempt: 1 };
+    });
+  } catch {
+    return { kind: 'storage' };
+  }
 }
 
 /**
- * Inside the lock. A retry continues the stored history: count + 1, uncertain stays true, body from storage.
- * A missing, malformed or unreadable record blocks (it is never recreated or reset).
+ * Inside the lock, one readwrite transaction. A retry continues the stored history: count + 1, uncertain
+ * stays true, body from storage. A missing, malformed or unreadable record blocks (never recreated or reset).
  */
-function beginRetryLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): Begin {
-  const slot = readSlot(key, pilots, lanes);
-  if (slot.kind === 'error') return { kind: 'storage' };
-  if (slot.kind === 'missing') return { kind: 'missing' };
-  if (slot.kind === 'malformed') return { kind: 'malformed' };
-  const record: PendingSubmission = { ...slot.record, uncertain: true, attempts: slot.record.attempts + 1 };
-  return writeVerified(record) ? { kind: 'ok', record, attempt: record.attempts } : { kind: 'storage' };
+async function beginRetryLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): Promise<Begin> {
+  try {
+    return await inTransaction(RECORDS_STORE, 'readwrite', async (store): Promise<Begin> => {
+      const slot = await readSlotIn(store, key, pilots, lanes);
+      if (slot.kind === 'error') throw new Error('read failed');
+      if (slot.kind === 'missing') return { kind: 'missing' };
+      if (slot.kind === 'malformed') return { kind: 'malformed' };
+      const record: PendingSubmission = { ...slot.record, uncertain: true, attempts: slot.record.attempts + 1 };
+      if (!(await writeRecordIn(store, record))) throw new Error('read-back mismatch');
+      return { kind: 'ok', record, attempt: record.attempts };
+    });
+  } catch {
+    return { kind: 'storage' };
+  }
 }
 
 /**
  * Inside the lock. An outcome stayed unknown. The stored record already says uncertain with a count at least
  * this attempt's (only beginRetryLocked raises it), so nothing is rewritten: never a lower count.
  */
-function keepUncertainLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): SlotRead['kind'] {
-  return readSlot(key, pilots, lanes).kind;
+async function keepUncertainLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): Promise<SlotRead['kind']> {
+  try {
+    return await inTransaction(RECORDS_STORE, 'readonly', async (store) => (await readSlotIn(store, key, pilots, lanes)).kind);
+  } catch {
+    return 'error';
+  }
 }
 
 /**
- * Inside the lock. Clears on resolution, deciding from the stored state only: 202 / 200 replay always; a
- * definitive refusal only when this dispatch was attempt 1 and the stored count is still exactly 1.
+ * Inside the lock, one readwrite transaction. Clears on resolution, deciding from the stored state only:
+ * 202 / 200 replay always; a definitive refusal only when this dispatch was attempt 1 and the stored count is
+ * still exactly 1.
  */
-function settleLocked(
+async function settleLocked(
   key: string,
   attempt: number,
   how: 'accepted' | 'refused',
   pilots: PilotOption[],
   lanes: LaneOption[]
-): 'cleared' | 'kept' | 'gone' | 'unreadable' {
-  const slot = readSlot(key, pilots, lanes);
-  if (slot.kind === 'missing') return 'gone';
-  if (slot.kind !== 'ok') return 'unreadable';
-  if (how === 'accepted' || (attempt === 1 && slot.record.attempts === attempt)) return removeSlot(key) ? 'cleared' : 'unreadable';
-  return 'kept';
+): Promise<'cleared' | 'kept' | 'gone' | 'unreadable'> {
+  try {
+    return await inTransaction(RECORDS_STORE, 'readwrite', async (store) => {
+      const slot = await readSlotIn(store, key, pilots, lanes);
+      if (slot.kind === 'missing') return 'gone' as const;
+      if (slot.kind !== 'ok') return 'unreadable' as const;
+      if (how === 'accepted' || (attempt === 1 && slot.record.attempts === attempt)) {
+        await idbRequest(store.delete(key));
+        return 'cleared' as const;
+      }
+      return 'kept' as const;
+    });
+  } catch {
+    return 'unreadable';
+  }
 }
 
 /** 15 s abort for one fetch; falls back to a timer where AbortSignal.timeout is missing. */
@@ -573,11 +683,12 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     } else if (stored) {
       storageRemove(STORAGE_KEY);
     }
-    const scan = scanPending(pilots, lanes);
-    setPendingList(scan.records);
-    setBadSlots(scan.badSlots);
-    setScanError(scan.error);
-    setStorageOk(storageWritable());
+    void scanPending(pilots, lanes).then((scan) => {
+      setPendingList(scan.records);
+      setBadSlots(scan.badSlots);
+      setScanError(scan.error);
+    });
+    void recordsStoreUsable().then(setStorageOk);
     setLocksOk(locksSupported());
   }, [idPattern, lanes, loadConfig, pilots, resetPolling]);
 
@@ -586,15 +697,20 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     setBadSlots(scan.badSlots);
     setScanError(scan.error);
   }, []);
-  const refreshPending = useCallback(() => applyScan(scanPending(pilots, lanes)), [applyScan, lanes, pilots]);
+  const refreshPending = useCallback(() => {
+    void scanPending(pilots, lanes).then(applyScan);
+  }, [applyScan, lanes, pilots]);
 
   // Another tab added or resolved a submission: refresh the unresolved list (blocks or unblocks this tab).
   useEffect(() => {
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key.startsWith(PENDING_PREFIX)) refreshPending();
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(RECORDS_CHANNEL);
+      channel.onmessage = () => refreshPending();
+    } catch {
+      channel = null;
+    }
+    return () => channel?.close();
   }, [refreshPending]);
 
   const activeId = tracked && !tracked.stopped && !STOP_STATES.has(tracked.state) ? tracked.requestId : null;
@@ -696,6 +812,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
       const locked = await withRecordsLock(() =>
         input.kind === 'fresh' ? beginFreshLocked(input.record, pilots, lanes) : beginRetryLocked(input.key, pilots, lanes)
       );
+      if (locked.ok && locked.value.kind === 'ok') notifyRecordsChanged();
       if (!locked.ok) {
         showError('lock_unavailable', locksSupported() ? LOCK_UNAVAILABLE_MESSAGE : LOCKS_MESSAGE);
         return;
@@ -750,7 +867,8 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     const accepted = isAcceptedView(payload, idPattern) ? payload : null;
     if (accepted && (response.status === 202 || (response.status === 200 && accepted.replay === true))) {
       // The key's outcome is established. If the lock is not granted the record simply stays (safe).
-      await withRecordsLock(() => settleLocked(submission.key, attempt, 'accepted', pilots, lanes));
+      const settled = await withRecordsLock(() => settleLocked(submission.key, attempt, 'accepted', pilots, lanes));
+      if (settled.ok && settled.value === 'cleared') notifyRecordsChanged();
       startTracking(
         accepted.requestId,
         {
@@ -782,6 +900,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     if (definitive || isDuplicate) {
       const settled = await withRecordsLock(() => settleLocked(submission.key, attempt, 'refused', pilots, lanes));
       cleared = settled.ok && (settled.value === 'cleared' || settled.value === 'gone');
+      if (settled.ok && settled.value === 'cleared') notifyRecordsChanged();
     }
     if (isDuplicate && cleared && error.requestId) {
       startTracking(error.requestId, { pilot: submission.pilot, lane: submission.lane, note: error.message }, true);
