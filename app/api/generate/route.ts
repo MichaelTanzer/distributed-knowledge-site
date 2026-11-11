@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { v4Enabled } from '../../../lib/v4Env';
 
 function validEmail(value: unknown): value is string {
   return typeof value === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value);
 }
 
 export async function POST(request: NextRequest) {
+  // v4 enabled (both DK_V4_* variables set, checked here on the Node side): refuse before any v3 work or upstream
+  // fetch, even if middleware.ts did not run or saw a different configuration. v4 disabled: unchanged v3 path.
+  if (v4Enabled()) {
+    return NextResponse.json(
+      { error: 'Generation has moved to the new form; reload /generate.' },
+      { status: 410, headers: { 'cache-control': 'no-store' } }
+    );
+  }
   const body = await request.json().catch(() => null);
   if (!body || !validEmail(body.email)) {
     return NextResponse.json({ error: 'Enter a valid delivery email.' }, { status: 400 });

@@ -185,13 +185,15 @@ export function stagingPageEnabled(): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * One strict ASCII address, local@domain.tld, at most 254 characters (local part at most 64): no CR or LF,
- * commas, semicolons, angle brackets, quotes, backticks or spaces; no leading, trailing or doubled dots in
- * the local part; domain labels of letters, digits and inner hyphens, ending in a 2-63 letter TLD. The same
+ * The backend's requester grammar (staging config REQUESTER_RE, with the leading-hyphen fix), full match:
+ * local part `[A-Za-z0-9_%+][A-Za-z0-9_%+-]*(?:\.[A-Za-z0-9_%+-]+)*` (at most 64 characters, so no leading
+ * hyphen or dot, no trailing or doubled dot, no other punctuation), then one or more domain labels
+ * `[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?` each followed by a dot, then a 2-63 letter TLD; at most 254
+ * characters in total. No CR/LF, commas, semicolons, angle brackets, quotes or spaces can match. The same
  * pattern is used by the browser form and by POST /api/v4/requests.
  */
 export const RECIPIENT_PATTERN =
-  /^(?=.{3,254}$)(?!\.)(?!.*\.\.)[A-Za-z0-9.!#$%&*+/=?^_{|}~-]{1,64}(?<!\.)@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
+  /^(?=.{1,254}$)(?=[^@]{1,64}@)[A-Za-z0-9_%+][A-Za-z0-9_%+\-]*(?:\.[A-Za-z0-9_%+\-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 
 export function isPublicRecipient(value: unknown): value is string {
   return typeof value === 'string' && RECIPIENT_PATTERN.test(value);
@@ -290,10 +292,8 @@ export function usd(value: unknown): string | null {
   return amount.toFixed(2);
 }
 
-const EMAIL_PATTERN = /^[^\s@<>()",;:]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$/;
-
 function recipientFrom(value: unknown): string | null {
-  return typeof value === 'string' && value.length <= 254 && EMAIL_PATTERN.test(value) ? value : null;
+  return isPublicRecipient(value) ? value : null;
 }
 
 function shortCode(value: unknown): string | null {

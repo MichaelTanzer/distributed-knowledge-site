@@ -51,7 +51,8 @@ const CLIENT_CODES: ReadonlySet<string> = new Set([
   'record_missing',
   'record_unreadable',
   'network_error',
-  'no_uuid'
+  'no_uuid',
+  'attempts_exhausted'
 ]);
 
 type Variant = 'operator' | 'public';
@@ -70,6 +71,8 @@ const COPY = {
       "This submission's record is no longer stored (it may have been resolved in another tab), so nothing was sent. Reload the page to see the current state.",
     recordUnreadable:
       "This submission's stored record can't be read safely, so nothing was sent and new runs stay blocked. An operator must check the backend before this browser's site data is cleared.",
+    attemptsExhausted:
+      "This submission's retry count can't be raised any further, so nothing was sent and new runs stay blocked. An operator must check the backend before this browser's site data is cleared.",
     network:
       'Network error: the outcome is unknown. Use “Retry the same submission”: it reuses the same request key, so the backend cannot start a second run for it.',
     pendingNote: 'Retry the earlier submission first; new runs are blocked until it resolves.',
@@ -91,6 +94,8 @@ const COPY = {
       "This request's record is no longer stored (it may have been resolved in another tab), so nothing was sent. Reload the page to see the current state.",
     recordUnreadable:
       "This request's stored record can't be read safely, so nothing was sent and new requests stay blocked. Please contact Distributed Knowledge before clearing this site's data.",
+    attemptsExhausted:
+      "This request can't be retried from this browser any more, so nothing was sent and new requests stay blocked. Please contact Distributed Knowledge before clearing this site's data.",
     network:
       'Network error: the outcome is unknown. Use “Retry the same submission”: it reuses the same request key, so the backend cannot start a second run for it.',
     pendingNote: 'Retry the earlier request first; new requests are blocked until it resolves.',
@@ -440,6 +445,7 @@ type Begin =
   | { kind: 'unresolved'; scan: PendingScan }
   | { kind: 'missing' }
   | { kind: 'malformed' }
+  | { kind: 'exhausted' }
   | { kind: 'storage' };
 
 /**
@@ -474,6 +480,8 @@ async function beginRetryLocked(key: string, catalog: Catalog): Promise<Begin> {
       if (slot.kind === 'error') throw new Error('read failed');
       if (slot.kind === 'missing') return { kind: 'missing' };
       if (slot.kind === 'malformed') return { kind: 'malformed' };
+      // The count must stay a safe integer (the parser rejects anything else): no write, no dispatch.
+      if (!(slot.record.attempts + 1 <= Number.MAX_SAFE_INTEGER)) return { kind: 'exhausted' };
       const record: PendingSubmission = { ...slot.record, uncertain: true, attempts: slot.record.attempts + 1 };
       if (!(await writeRecordIn(store, record))) throw new Error('read-back mismatch');
       return { kind: 'ok', record, attempt: record.attempts };
@@ -907,6 +915,10 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
         showError('record_unreadable', copy.recordUnreadable);
         return;
       }
+      if (begun.kind === 'exhausted') {
+        showError('attempts_exhausted', copy.attemptsExhausted);
+        return;
+      }
       if (begun.kind === 'storage') {
         setStorageOk(false);
         showError('storage_unavailable', copy.storage);
@@ -1114,7 +1126,8 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
       />
       {trimmedRecipient !== '' && !recipientValid && (
         <span className="notice error v4s-recipient-hint">
-          Enter a single email address (no spaces, commas, semicolons, quotes or angle brackets).
+          Enter one email address: only letters, digits and . _ % + - before the domain (not starting with - or .), and no
+          spaces, commas or other punctuation.
         </span>
       )}
       <span className="v4s-muted">

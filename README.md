@@ -23,9 +23,11 @@ v4 is enabled when **both** of these are set (non-empty), in Production or Previ
 
 | `DK_V4_*` variables | `/generate` | `/api/generate` (v3) | `/api/v4/*` |
 |---|---|---|---|
-| both set | v4 form (served from the internal route `/generate-v4`) | `410` "Generation has moved to the new form; reload /generate." (no v3 upstream call) | enabled |
+| both set | v4 form (served from the internal route `/generate-v4`) | `410` "Generation has moved to the new form; reload /generate." (no v3 upstream call; refused by `middleware.ts` and again by the route itself) | enabled |
 | neither set | v3 form, byte-identical to before | v3, unchanged | `404` |
 | only one set | v3 form (as above) | v3, unchanged | `404`; the server logs a `v4_partial_config` warning naming the variables (never their values) |
+
+`middleware.ts` fails open: if it throws, the request continues to the unchanged route and a `v4_middleware_error` event (error name only) is logged. The v3 route (`app/api/generate/route.ts`) checks the same two variables itself and answers the same `410` before any v3 work when v4 is enabled, so a middleware failure or an edge/Node configuration mismatch never reaches the paid v3 backend.
 
 Rollback: remove the `DK_V4_*` variables from the environment and redeploy; `/generate` is v3 again. The site never falls back to v3 automatically after a v4 refusal (busy, paused, rate limit, capacity).
 
@@ -35,7 +37,7 @@ The v4 form asks for the requester's email, a KIQ (SL-002 / SL-028 / SL-035) and
 
 ## v4 operator page (Preview only)
 
-`/v4-staging` is the operator view of the same form (budget figures, reservation caps, acknowledgement). It returns `404` unless `VERCEL_ENV` is `preview` **and** v4 is enabled. On Preview the API also returns operator views (budget figures, backend messages); on Production every money figure is omitted and every error message is replaced by public wording.
+`/v4-staging` is the operator view of the same form (budget figures, reservation caps, acknowledgement). It returns `404` unless `VERCEL_ENV` is `preview` **and** v4 is enabled. On Preview the API also returns operator views (budget figures, backend messages). On Production the API responses and the rendered pages carry no monetary values, and every error message is replaced by public wording; the lane reservation caps in `lib/v4Staging.ts` are public source.
 
 ## v4 API routes
 
@@ -44,9 +46,9 @@ All Node.js runtime, dynamic, `Cache-Control: no-store`; `404` unless v4 is enab
 | Route | Backend call | Notes |
 |---|---|---|
 | `GET /api/v4/config` | `GET /v1/config` | Sanitised view: spend state, run in progress, reconciliation; on Preview also remaining budget and lane caps. |
-| `POST /api/v4/requests` | `GET /v1/config`, then `POST /v1/requests` | Same-origin only (`Sec-Fetch-Site` must be `same-origin`, a missing header is refused, and `Origin` must match). Body at most 2 KB with exactly `pilot`, `lane`, `recipient`. `recipient` must be one ASCII address `local@domain.tld`, at most 254 characters, without CR/LF, commas, semicolons, angle brackets, quotes or spaces (else `400 invalid_recipient`, before any backend call). Requires a UUID `Idempotency-Key`. `ack_cap_usd` is supplied from the backend config for the chosen lane. |
+| `POST /api/v4/requests` | `GET /v1/config`, then `POST /v1/requests` | Same-origin only (`Sec-Fetch-Site` must be `same-origin`, a missing header is refused, and `Origin` must match). Body at most 2 KB with exactly `pilot`, `lane`, `recipient`. `recipient` must match the backend's requester grammar exactly: a local part of letters, digits, `_`, `%`, `+` and `-` in dot-separated parts, not starting with `-` or `.` and at most 64 characters; domain labels of letters, digits and inner hyphens; a 2–63 letter TLD; at most 254 characters in total (else `400 invalid_recipient`, before any backend call). Requires a UUID `Idempotency-Key`. `ack_cap_usd` is supplied from the backend config for the chosen lane. |
 | `GET /api/v4/requests/<id>` | `GET /v1/requests/<id>` | Status: state, reason code, timestamps (money fields on Preview only). |
 
-The routes send the backend only `Authorization: Bearer`, `X-DK-Client-IP` (the first `x-forwarded-for` entry, if it is a valid IP), `Idempotency-Key` and a JSON content type. Browser cookies and other headers are never forwarded. Known backend error codes (`rate_limited`, `daily_spend_ceiling_reached`, `run_in_progress`, `duplicate`, `idempotency_conflict`, `cap_ack_mismatch`, `spend_disabled`, `staging_budget_exhausted`, `reconciliation_required`, `recipient_not_allowed`, `invalid_recipient`, `origin_not_allowed`, `bad_client_ip`) keep their code; on Preview the backend message passes through, on Production the public wording replaces it. Anything else becomes a generic error. All backend JSON field names are kept in `BACKEND_FIELDS` in `lib/v4Staging.ts`.
+The routes send the backend only `Authorization: Bearer`, `X-DK-Client-IP` (the first `x-forwarded-for` entry, if it is a valid IP), `Idempotency-Key` and a JSON content type. Browser cookies and other headers are never forwarded. The `Origin` and `Sec-Fetch-Site` checks are browser CSRF protection, not authorization: a non-browser client can set them; the backend's own per-IP and per-address limits and admission control apply. Known backend error codes (`rate_limited`, `daily_spend_ceiling_reached`, `run_in_progress`, `duplicate`, `idempotency_conflict`, `cap_ack_mismatch`, `spend_disabled`, `staging_budget_exhausted`, `reconciliation_required`, `recipient_not_allowed`, `invalid_recipient`, `origin_not_allowed`, `bad_client_ip`) keep their code; on Preview the backend message passes through, on Production the public wording replaces it. Anything else becomes a generic error. All backend JSON field names are kept in `BACKEND_FIELDS` in `lib/v4Staging.ts`.
 
 No backend address or token belongs in this repository.
