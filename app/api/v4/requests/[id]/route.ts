@@ -1,7 +1,6 @@
 import type { NextRequest } from 'next/server';
 import {
   BACKEND_PATHS,
-  apiError,
   backendRequest,
   clientIpFrom,
   errorResponse,
@@ -11,8 +10,10 @@ import {
   mapBackendFailure,
   methodNotAllowed,
   normalizeStatus,
-  stagingEnabled,
-  stagingNotFound
+  publicError,
+  stagingNotFound,
+  statusForAudience,
+  v4Enabled
 } from '../../../../../lib/v4Staging';
 
 export const runtime = 'nodejs';
@@ -22,14 +23,14 @@ export const maxDuration = 20;
 
 /** GET /api/v4/requests/<id> → backend GET /v1/requests/<id>, sanitised. */
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  if (!stagingEnabled()) return stagingNotFound();
-  if (isCrossSiteGet(request)) return apiError(403, 'origin_not_allowed', 'Cross-site requests are not allowed.');
+  if (!v4Enabled()) return stagingNotFound();
+  if (isCrossSiteGet(request)) return errorResponse(publicError({ status: 403, body: { code: 'origin_not_allowed', message: 'Cross-site requests are not allowed.' } }));
 
   const { id } = await params;
-  if (!isRequestId(id)) return apiError(400, 'invalid_request_id', 'The request id is not valid.');
+  if (!isRequestId(id)) return errorResponse(publicError({ status: 400, body: { code: 'invalid_request_id', message: 'The request id is not valid.' } }));
 
   const result = await backendRequest(BACKEND_PATHS.request(id), { method: 'GET', clientIp: clientIpFrom(request) });
-  if (result.kind !== 'ok') return errorResponse(mapBackendFailure(result, 'status'));
+  if (result.kind !== 'ok') return errorResponse(publicError(mapBackendFailure(result, 'status')));
 
   let status: ReturnType<typeof normalizeStatus> = null;
   try {
@@ -37,8 +38,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   } catch {
     status = null;
   }
-  if (!status) return apiError(502, 'backend_error', 'The staging backend status could not be read.');
-  return jsonResponse(200, status);
+  if (!status) return errorResponse(publicError({ status: 502, body: { code: 'backend_error', message: 'The staging backend status could not be read.' } }));
+  // Public deployments omit the money fields.
+  return jsonResponse(200, statusForAudience(status));
 }
 
 export function POST() {

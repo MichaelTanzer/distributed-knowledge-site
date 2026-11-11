@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
 import {
   BACKEND_PATHS,
-  apiError,
+  configForAudience,
   backendRequest,
   clientIpFrom,
   errorResponse,
@@ -10,8 +10,9 @@ import {
   mapBackendFailure,
   methodNotAllowed,
   normalizeConfig,
-  stagingEnabled,
-  stagingNotFound
+  publicError,
+  stagingNotFound,
+  v4Enabled
 } from '../../../../lib/v4Staging';
 
 export const runtime = 'nodejs';
@@ -19,17 +20,18 @@ export const dynamic = 'force-dynamic';
 /** One backend call bounded at 15 s. */
 export const maxDuration = 20;
 
-/** GET /api/v4/config → backend GET /v1/config, returned as a sanitised view. */
+/** GET /api/v4/config → backend GET /v1/config, returned as a sanitised view (operator view only on Preview). */
 export async function GET(request: NextRequest) {
-  if (!stagingEnabled()) return stagingNotFound();
-  if (isCrossSiteGet(request)) return apiError(403, 'origin_not_allowed', 'Cross-site requests are not allowed.');
+  if (!v4Enabled()) return stagingNotFound();
+  if (isCrossSiteGet(request)) return errorResponse(publicError({ status: 403, body: { code: 'origin_not_allowed', message: 'Cross-site requests are not allowed.' } }));
 
   const result = await backendRequest(BACKEND_PATHS.config, { method: 'GET', clientIp: clientIpFrom(request) });
-  if (result.kind !== 'ok') return errorResponse(mapBackendFailure(result, 'config'));
+  if (result.kind !== 'ok') return errorResponse(publicError(mapBackendFailure(result, 'config')));
   try {
-    return jsonResponse(200, normalizeConfig(result.json));
+    // Public deployments get the same shape with every money / build figure nulled.
+    return jsonResponse(200, configForAudience(normalizeConfig(result.json)));
   } catch {
-    return apiError(502, 'backend_error', 'The staging backend configuration could not be read.');
+    return errorResponse(publicError({ status: 502, body: { code: 'backend_error', message: 'The staging backend configuration could not be read.' } }));
   }
 }
 

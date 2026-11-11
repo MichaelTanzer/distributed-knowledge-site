@@ -9,6 +9,9 @@
  */
 import { isIP } from 'node:net';
 import { NextResponse } from 'next/server';
+import { operatorPreview, v4Enabled } from './v4Env';
+
+export { operatorPreview, v4Enabled };
 
 if (typeof window !== 'undefined') {
   throw new Error('lib/v4Staging is server-only');
@@ -82,9 +85,8 @@ export const BACKEND_FIELDS = {
     ackCapUsd: 'ack_cap_usd'
   },
   /**
-   * GET /v1/config response. `recipient` / `allowedRecipients` are NOT in the
-   * backend's config view yet (contract gap); until one is added the page
-   * shows no recipient and submission fails closed (503 recipient_unavailable).
+   * GET /v1/config response. `recipient` / `allowedRecipients` are informational only (operator view;
+   * empty in public recipient mode): the submitted recipient is always the requester's own email.
    */
   config: {
     recipient: 'recipient',
@@ -165,20 +167,34 @@ export function isUuid(value: unknown): value is string {
 }
 
 // ---------------------------------------------------------------------------
-// Preview guard
+// Guards: v4Enabled() (lib/v4Env.ts) gates /generate's v4 form and the /api/v4 routes in any environment;
+// the operator page /v4-staging additionally needs a Vercel Preview deployment.
 // ---------------------------------------------------------------------------
 
 function envValue(name: 'DK_V4_STAGING_URL' | 'DK_V4_STAGING_TOKEN'): string {
   return (process.env[name] ?? '').trim();
 }
 
-/** True only on a Vercel Preview deployment that has both staging env vars. */
-export function stagingEnabled(): boolean {
-  return (
-    process.env.VERCEL_ENV === 'preview' &&
-    envValue('DK_V4_STAGING_URL') !== '' &&
-    envValue('DK_V4_STAGING_TOKEN') !== ''
-  );
+/** The operator page: Vercel Preview only, and v4 configured. */
+export function stagingPageEnabled(): boolean {
+  return operatorPreview() && v4Enabled();
+}
+
+// ---------------------------------------------------------------------------
+// Requester email (the public form's recipient)
+// ---------------------------------------------------------------------------
+
+/**
+ * One strict ASCII address, local@domain.tld, at most 254 characters (local part at most 64): no CR or LF,
+ * commas, semicolons, angle brackets, quotes, backticks or spaces; no leading, trailing or doubled dots in
+ * the local part; domain labels of letters, digits and inner hyphens, ending in a 2-63 letter TLD. The same
+ * pattern is used by the browser form and by POST /api/v4/requests.
+ */
+export const RECIPIENT_PATTERN =
+  /^(?=.{3,254}$)(?!\.)(?!.*\.\.)[A-Za-z0-9.!#$%&*+/=?^_{|}~-]{1,64}(?<!\.)@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
+
+export function isPublicRecipient(value: unknown): value is string {
+  return typeof value === 'string' && RECIPIENT_PATTERN.test(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +419,7 @@ export const KNOWN_ERROR_STATUS = {
   staging_budget_exhausted: 503,
   reconciliation_required: 503,
   recipient_not_allowed: 403,
+  invalid_recipient: 400,
   origin_not_allowed: 403,
   bad_client_ip: 400
 } as const;
@@ -420,9 +437,76 @@ const KNOWN_ERROR_FALLBACK: Record<KnownErrorCode, string> = {
   staging_budget_exhausted: 'The overall staging budget is exhausted.',
   reconciliation_required: 'An earlier run needs operator reconciliation; no new runs are accepted until then.',
   recipient_not_allowed: 'The recipient is not on the staging allowlist.',
+  invalid_recipient: 'Enter a single valid email address.',
   origin_not_allowed: 'This origin is not allowed.',
   bad_client_ip: 'The client address could not be determined.'
 };
+
+/**
+ * Wording for the public (production) API and the public /generate form, by error code. It never carries
+ * budget figures, internal state or backend text. `default` covers every other code.
+ */
+export const PUBLIC_ERROR_COPY: Readonly<Record<string, string>> = {
+  daily_spend_ceiling_reached: "Today's capacity is used up; please try again after 00:00 UTC.",
+  staging_budget_exhausted: 'Generation is temporarily unavailable. Please try again later.',
+  run_in_progress: 'Another request is being generated right now (runs take 20–70 minutes). Please try again later.',
+  rate_limited: 'Too many requests for this email address or connection. Please try again later.',
+  invalid_recipient: 'Enter a single valid email address.',
+  spend_disabled: 'Generation is paused right now. Please try again later.',
+  reconciliation_required: 'Generation is temporarily unavailable. Please try again later.',
+  idempotency_conflict: 'This request could not be matched to your earlier attempt. Please contact Distributed Knowledge.',
+  duplicate: 'This request was already received.',
+  origin_not_allowed: 'Please send the request from the Distributed Knowledge website.',
+  bad_client_ip: 'Your connection could not be identified. Please try again later.',
+  invalid_request: 'Please check the form and try again.',
+  body_too_large: 'Please check the form and try again.',
+  unsupported_media_type: 'Please check the form and try again.',
+  invalid_idempotency_key: 'Please reload the page and try again.',
+  invalid_request_id: 'Please reload the page and try again.',
+  not_found: 'This request is no longer known.',
+  backend_timeout: 'Generation is temporarily unavailable. Please try again later.',
+  backend_unavailable: 'Generation is temporarily unavailable. Please try again later.',
+  backend_error: 'Generation is temporarily unavailable. Please try again later.',
+  backend_auth_failed: 'Generation is temporarily unavailable. Please try again later.',
+  staging_misconfigured: 'Generation is temporarily unavailable. Please try again later.',
+  v4_unavailable: 'Generation is temporarily unavailable. Please try again later.',
+  default: 'Something went wrong. Please try again later.'
+};
+
+/** Public deployments (not Vercel Preview) replace every error message with PUBLIC_ERROR_COPY. */
+export function publicError(mapped: MappedError): MappedError {
+  if (operatorPreview()) return mapped;
+  const message = PUBLIC_ERROR_COPY[mapped.body.code] ?? PUBLIC_ERROR_COPY.default;
+  const body: ApiErrorView = { code: mapped.body.code, message };
+  if (mapped.body.retryAfterSeconds !== undefined) body.retryAfterSeconds = mapped.body.retryAfterSeconds;
+  if (mapped.body.requestId !== undefined) body.requestId = mapped.body.requestId;
+  return { status: mapped.status, body };
+}
+
+/** Public deployments omit every money and build figure from the config view (same shape, nulled). */
+export function configForAudience(view: StagingConfigView): StagingConfigView {
+  if (operatorPreview()) return view;
+  return {
+    ...view,
+    recipient: null,
+    dailyRemainingUsd: null,
+    dailyCapUsd: null,
+    totalRemainingUsd: null,
+    totalCapUsd: null,
+    dayUtc: null,
+    laneCapsUsd: {},
+    backendSha: null
+  };
+}
+
+/** Public deployments omit the money fields of a request status / acceptance. */
+export function statusForAudience(view: RequestStatusView): RequestStatusView {
+  return operatorPreview() ? view : { ...view, capUsd: null, committedUsd: null, reservedUsd: null };
+}
+
+export function acceptedForAudience(view: SubmitAcceptedView): SubmitAcceptedView {
+  return operatorPreview() ? view : { ...view, capUsd: null, dailyRemainingUsd: null };
+}
 
 const GENERIC_BACKEND_MESSAGE = 'The staging backend could not process this request. Try again later.';
 
@@ -669,34 +753,37 @@ export async function readBodyLimited(request: Request, limit: number): Promise<
   }
 }
 
-export type SubmitBody = { pilot: PilotValue; lane: LaneValue; ackCapUsd: string };
+export type SubmitBody = { pilot: PilotValue; lane: LaneValue; recipient: string };
 
-const SUBMIT_KEYS = ['ack_cap_usd', 'lane', 'pilot'];
+const SUBMIT_KEYS = ['lane', 'pilot', 'recipient'];
 
-/** Strict browser body: exactly `pilot`, `lane`, `ack_cap_usd`; anything else is rejected. */
-export function parseSubmitBody(text: string): SubmitBody | null {
+/**
+ * Strict browser body: exactly `pilot`, `lane`, `recipient` (the requester's email). The reservation cap
+ * acknowledgement is not taken from the browser; the route supplies it from the backend config.
+ */
+export function parseSubmitBody(text: string): { ok: true; body: SubmitBody } | { ok: false; reason: 'shape' | 'recipient' } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return null;
+    return { ok: false, reason: 'shape' };
   }
-  if (!isObject(parsed)) return null;
+  if (!isObject(parsed)) return { ok: false, reason: 'shape' };
   const keys = Object.keys(parsed).sort();
-  if (keys.length !== SUBMIT_KEYS.length || keys.some((key, index) => key !== SUBMIT_KEYS[index])) return null;
-  const { pilot, lane, ack_cap_usd: ackCapUsd } = parsed;
-  if (!isPilot(pilot) || !isLane(lane)) return null;
-  if (typeof ackCapUsd !== 'string' || !/^\d{1,4}\.\d{2}$/.test(ackCapUsd)) return null;
-  return { pilot, lane, ackCapUsd };
+  if (keys.length !== SUBMIT_KEYS.length || keys.some((key, index) => key !== SUBMIT_KEYS[index])) return { ok: false, reason: 'shape' };
+  const { pilot, lane, recipient } = parsed;
+  if (!isPilot(pilot) || !isLane(lane)) return { ok: false, reason: 'shape' };
+  if (!isPublicRecipient(recipient)) return { ok: false, reason: 'recipient' };
+  return { ok: true, body: { pilot, lane, recipient } };
 }
 
-export function backendSubmitBody(body: SubmitBody, recipient: string): string {
+export function backendSubmitBody(body: SubmitBody, ackCapUsd: string): string {
   const f = BACKEND_FIELDS.requestBody;
   return JSON.stringify({
     [f.pilot]: body.pilot,
     [f.lane]: body.lane,
-    [f.recipient]: recipient,
-    [f.ackCapUsd]: body.ackCapUsd
+    [f.recipient]: body.recipient,
+    [f.ackCapUsd]: ackCapUsd
   });
 }
 
@@ -730,6 +817,6 @@ export function stagingNotFound(): Response {
 
 /** Any method a route does not implement: 404 when off, 405 when on. */
 export function methodNotAllowed(allow: string): Response {
-  if (!stagingEnabled()) return stagingNotFound();
+  if (!v4Enabled()) return stagingNotFound();
   return new Response(null, { status: 405, headers: { allow, 'cache-control': 'no-store' } });
 }

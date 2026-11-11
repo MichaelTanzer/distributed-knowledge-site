@@ -69,6 +69,7 @@ export const V4_STAGING_CSS = `
 .v4s-field { display: grid; gap: 6px; }
 .v4s-form select,
 .v4s-form input[type="text"],
+.v4s-form input[type="email"],
 .v4s-submit,
 .v4s-link {
   border: 1px solid var(--line);
@@ -129,6 +130,10 @@ export const V4_STAGING_CSS = `
 .v4s-pending { border-color: rgba(255, 217, 160, 0.55); }
 .v4s-message + .v4s-message { margin-top: 4px; }
 .v4s-footnote { font-size: 11px; }
+.v4s-notice { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink); }
+.v4s-recipient-hint { margin: 0; }
+.v4s-form input:disabled,
+.v4s-form select:disabled { opacity: .6; }
 .v4s-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .v4s-state {
   display: inline-block;
