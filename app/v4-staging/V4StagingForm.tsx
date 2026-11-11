@@ -36,6 +36,16 @@ const STOP_STATES: ReadonlySet<RequestState> = new Set<RequestState>([...TERMINA
 const KEY_DEPENDENT_CODES: ReadonlySet<string> = new Set(['invalid_idempotency_key', 'idempotency_conflict']);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STORAGE_REQUIRED_MESSAGE = "Can't save submission state in this browser; enable site storage to start a paid run.";
+/** One origin-wide Web Lock serialises every read-modify-write of the recovery records across tabs. */
+const LOCK_NAME = 'dkV4Staging.records';
+const LOCK_TIMEOUT_MS = 10_000;
+const LOCKS_MESSAGE = "This browser can't safely coordinate paid runs across tabs; use a current Chrome, Edge, Firefox or Safari.";
+const LOCK_UNAVAILABLE_MESSAGE =
+  'Could not coordinate with other tabs in time (the submission lock was not granted), so nothing was sent. Try again.';
+const RECORD_GONE_MESSAGE =
+  "This submission's record is no longer stored (it may have been resolved in another tab), so nothing was sent. Reload the page to see the current state.";
+const RECORD_UNREADABLE_MESSAGE =
+  "This submission's stored record can't be read safely, so nothing was sent and new runs stay blocked. An operator must check the backend before this browser's site data is cleared.";
 const UNRESOLVED_MESSAGE =
   'An earlier submission from this browser has an unknown outcome. Retry it first: it reuses the same request key, so it cannot start a second run. New runs are blocked until it resolves.';
 const ACK_PATTERN = /^\d{1,4}\.\d{2}$/;
@@ -145,118 +155,203 @@ function storageWritable(): boolean {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Result of reading one record slot: "absent", "corrupt" and "storage failed" are never conflated. */
+type SlotRead =
+  | { kind: 'missing' }
+  | { kind: 'ok'; record: PendingSubmission }
+  | { kind: 'malformed' }
+  | { kind: 'error' };
+
 /**
- * Saves the submission's own recovery record (key bound to its exact body) and confirms it reads
- * back. A paid submission is only dispatched when this returns true, so its key can be recovered.
+ * Strict parse: every field present and valid, uncertain === true, attempts a positive safe integer, and the
+ * record's key equal to the key of the slot it was read from (otherwise the slot is malformed).
  */
-function persistRecord(submission: PendingSubmission): boolean {
-  const serialized = JSON.stringify(submission);
+function parseRecord(raw: string, slotKey: string, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
+  let parsed: unknown = null;
   try {
-    window.localStorage.setItem(PENDING_PREFIX + submission.key, serialized);
-    return window.localStorage.getItem(PENDING_PREFIX + submission.key) === serialized;
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const { key, pilot, lane, ack_cap_usd: ack, createdAt, uncertain, attempts } = parsed;
+  const pilotOk = pilots.find((option) => option.value === pilot);
+  const laneOk = lanes.find((option) => option.value === lane);
+  if (
+    typeof key === 'string' &&
+    key === slotKey &&
+    UUID_PATTERN.test(key) &&
+    pilotOk &&
+    laneOk &&
+    typeof ack === 'string' &&
+    ACK_PATTERN.test(ack) &&
+    typeof createdAt === 'number' &&
+    Number.isFinite(createdAt) &&
+    uncertain === true &&
+    typeof attempts === 'number' &&
+    Number.isSafeInteger(attempts) &&
+    attempts >= 1
+  ) {
+    return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt, uncertain: true, attempts };
+  }
+  return null;
+}
+
+function readSlot(key: string, pilots: PilotOption[], lanes: LaneOption[]): SlotRead {
+  let raw: string | null;
+  try {
+    raw = window.localStorage.getItem(PENDING_PREFIX + key);
+  } catch {
+    return { kind: 'error' };
+  }
+  if (raw === null) return { kind: 'missing' };
+  const record = parseRecord(raw, key, pilots, lanes);
+  return record ? { kind: 'ok', record } : { kind: 'malformed' };
+}
+
+/** Writes one record and confirms it reads back byte-for-byte. Call only inside the records lock. */
+function writeVerified(record: PendingSubmission): boolean {
+  const serialized = JSON.stringify(record);
+  try {
+    window.localStorage.setItem(PENDING_PREFIX + record.key, serialized);
+    return window.localStorage.getItem(PENDING_PREFIX + record.key) === serialized;
   } catch {
     return false;
   }
 }
 
-/** Removes exactly one resolved submission's record; other submissions' records are untouched. */
-function clearRecord(key: string): void {
-  storageRemove(PENDING_PREFIX + key);
-}
-
-function readRecord(key: string, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
-  return parseRecord(storageGet(PENDING_PREFIX + key), pilots, lanes);
-}
-
-/**
- * Before every fetch: re-read the stored record (its body wins for an existing key), mark it uncertain and
- * count this attempt. Returns the record to send and its attempt number, or null when the write or its
- * read-back failed (then nothing may be sent).
- */
-function beginAttempt(
-  submission: PendingSubmission,
-  pilots: PilotOption[],
-  lanes: LaneOption[]
-): { record: PendingSubmission; attempt: number } | null {
-  const stored = readRecord(submission.key, pilots, lanes);
-  const attempt = (stored?.attempts ?? 0) + 1;
-  const record: PendingSubmission = { ...(stored ?? submission), uncertain: true, attempts: attempt };
-  return persistRecord(record) ? { record, attempt } : null;
-}
-
-/** An outcome stayed unknown: re-assert the record (recreating it if needed); never downgrade flag or count. */
-function keepUncertain(submission: PendingSubmission, attempt: number, pilots: PilotOption[], lanes: LaneOption[]): void {
-  const stored = readRecord(submission.key, pilots, lanes);
-  persistRecord({ ...(stored ?? submission), uncertain: true, attempts: Math.max(stored?.attempts ?? 0, attempt) });
-}
-
-/**
- * A definitive key-independent refusal was received for this page's dispatch. It settles the key only when
- * that dispatch was the key's sole attempt (attempt 1, stored count still 1). Returns true when the record
- * is gone (cleared now, or already resolved elsewhere).
- */
-function settleIfSoleAttempt(key: string, attempt: number, pilots: PilotOption[], lanes: LaneOption[]): boolean {
-  const stored = readRecord(key, pilots, lanes);
-  if (!stored) return true;
-  if (attempt === 1 && stored.attempts === 1) {
-    clearRecord(key);
-    return true;
-  }
-  return false;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseRecord(raw: string | null, pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission | null {
-  if (!raw) return null;
-  let parsed: unknown = null;
+function removeSlot(key: string): boolean {
   try {
-    parsed = JSON.parse(raw);
+    window.localStorage.removeItem(PENDING_PREFIX + key);
+    return true;
   } catch {
-    parsed = null;
+    return false;
   }
-  if (isRecord(parsed)) {
-    const { key, pilot, lane, ack_cap_usd: ack, createdAt, uncertain, attempts } = parsed;
-    const pilotOk = pilots.find((option) => option.value === pilot);
-    const laneOk = lanes.find((option) => option.value === lane);
-    if (
-      typeof key === 'string' &&
-      UUID_PATTERN.test(key) &&
-      pilotOk &&
-      laneOk &&
-      typeof ack === 'string' &&
-      ACK_PATTERN.test(ack) &&
-      typeof createdAt === 'number' &&
-      Number.isFinite(createdAt)
-    ) {
-      // A missing or malformed flag reads as uncertain; a missing count reads as one earlier dispatch.
-      const count = typeof attempts === 'number' && Number.isInteger(attempts) && attempts >= 1 ? attempts : 1;
-      return { key, pilot: pilotOk.value, lane: laneOk.value, ack_cap_usd: ack, createdAt, uncertain: uncertain !== false, attempts: count };
-    }
-  }
-  return null;
 }
 
-/**
- * All unresolved submissions recorded in this browser (any tab), oldest first. Unreadable entries are
- * ignored but never deleted.
- */
-function listPending(pilots: PilotOption[], lanes: LaneOption[]): PendingSubmission[] {
-  const records: PendingSubmission[] = [];
+interface PendingScan {
+  records: PendingSubmission[];
+  /** Slots under the prefix that are unreadable or malformed (including key/slot mismatch); they block. */
+  badSlots: string[];
+  /** True when storage itself could not be read; it blocks. */
+  error: boolean;
+}
+
+/** All recovery records in this browser (any tab), oldest first, plus any malformed slots. Read-only. */
+function scanPending(pilots: PilotOption[], lanes: LaneOption[]): PendingScan {
+  const scan: PendingScan = { records: [], badSlots: [], error: false };
+  const names: string[] = [];
   try {
     const storage = window.localStorage;
     for (let index = 0; index < storage.length; index += 1) {
       const name = storage.key(index);
-      if (!name || !name.startsWith(PENDING_PREFIX)) continue;
-      const record = parseRecord(storage.getItem(name), pilots, lanes);
-      if (record && name === PENDING_PREFIX + record.key) records.push(record);
+      if (name && name.startsWith(PENDING_PREFIX)) names.push(name);
     }
   } catch {
-    return records;
+    scan.error = true;
+    return scan;
   }
-  return records.sort((a, b) => a.createdAt - b.createdAt);
+  for (const name of names) {
+    const slot = readSlot(name.slice(PENDING_PREFIX.length), pilots, lanes);
+    if (slot.kind === 'ok') scan.records.push(slot.record);
+    else if (slot.kind === 'malformed') scan.badSlots.push(name);
+    else if (slot.kind === 'error') scan.error = true;
+  }
+  scan.records.sort((a, b) => a.createdAt - b.createdAt);
+  return scan;
+}
+
+function locksSupported(): boolean {
+  try {
+    return typeof navigator !== 'undefined' && !!navigator.locks && typeof navigator.locks.request === 'function';
+  } catch {
+    return false;
+  }
+}
+
+type Locked<T> = { ok: true; value: T } | { ok: false };
+
+/**
+ * Runs `critical` (storage operations only, never a fetch) while holding the origin-wide records lock, so
+ * record mutations in all tabs are serialised. Fails closed: no Web Locks, a timeout or an error -> ok:false.
+ */
+async function withRecordsLock<T>(critical: () => T): Promise<Locked<T>> {
+  if (!locksSupported()) return { ok: false };
+  try {
+    const value = (await navigator.locks.request(
+      LOCK_NAME,
+      { mode: 'exclusive', signal: timeoutSignal(LOCK_TIMEOUT_MS) },
+      async () => critical()
+    )) as T;
+    return { ok: true, value };
+  } catch {
+    return { ok: false };
+  }
+}
+
+type Begin =
+  | { kind: 'ok'; record: PendingSubmission; attempt: number }
+  | { kind: 'unresolved'; scan: PendingScan }
+  | { kind: 'missing' }
+  | { kind: 'malformed' }
+  | { kind: 'storage' };
+
+/**
+ * Inside the lock. A genuinely fresh submission: only when no unresolved, malformed or unreadable record
+ * exists (checked in the same critical section) is its record written, at attempt 1.
+ */
+function beginFreshLocked(fresh: PendingSubmission, pilots: PilotOption[], lanes: LaneOption[]): Begin {
+  const scan = scanPending(pilots, lanes);
+  if (scan.error) return { kind: 'storage' };
+  if (scan.records.length > 0 || scan.badSlots.length > 0) return { kind: 'unresolved', scan };
+  const slot = readSlot(fresh.key, pilots, lanes);
+  if (slot.kind === 'error') return { kind: 'storage' };
+  if (slot.kind !== 'missing') return { kind: 'malformed' };
+  const record: PendingSubmission = { ...fresh, uncertain: true, attempts: 1 };
+  return writeVerified(record) ? { kind: 'ok', record, attempt: 1 } : { kind: 'storage' };
+}
+
+/**
+ * Inside the lock. A retry continues the stored history: count + 1, uncertain stays true, body from storage.
+ * A missing, malformed or unreadable record blocks (it is never recreated or reset).
+ */
+function beginRetryLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): Begin {
+  const slot = readSlot(key, pilots, lanes);
+  if (slot.kind === 'error') return { kind: 'storage' };
+  if (slot.kind === 'missing') return { kind: 'missing' };
+  if (slot.kind === 'malformed') return { kind: 'malformed' };
+  const record: PendingSubmission = { ...slot.record, uncertain: true, attempts: slot.record.attempts + 1 };
+  return writeVerified(record) ? { kind: 'ok', record, attempt: record.attempts } : { kind: 'storage' };
+}
+
+/**
+ * Inside the lock. An outcome stayed unknown. The stored record already says uncertain with a count at least
+ * this attempt's (only beginRetryLocked raises it), so nothing is rewritten: never a lower count.
+ */
+function keepUncertainLocked(key: string, pilots: PilotOption[], lanes: LaneOption[]): SlotRead['kind'] {
+  return readSlot(key, pilots, lanes).kind;
+}
+
+/**
+ * Inside the lock. Clears on resolution, deciding from the stored state only: 202 / 200 replay always; a
+ * definitive refusal only when this dispatch was attempt 1 and the stored count is still exactly 1.
+ */
+function settleLocked(
+  key: string,
+  attempt: number,
+  how: 'accepted' | 'refused',
+  pilots: PilotOption[],
+  lanes: LaneOption[]
+): 'cleared' | 'kept' | 'gone' | 'unreadable' {
+  const slot = readSlot(key, pilots, lanes);
+  if (slot.kind === 'missing') return 'gone';
+  if (slot.kind !== 'ok') return 'unreadable';
+  if (how === 'accepted' || (attempt === 1 && slot.record.attempts === attempt)) return removeSlot(key) ? 'cleared' : 'unreadable';
+  return 'kept';
 }
 
 /** 15 s abort for one fetch; falls back to a timer where AbortSignal.timeout is missing. */
@@ -349,6 +444,10 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitState, setSubmitState] = useState<SubmitState>({ status: 'idle' });
   const [pendingList, setPendingList] = useState<PendingSubmission[]>([]);
+  const [badSlots, setBadSlots] = useState<string[]>([]);
+  const [scanError, setScanError] = useState(false);
+  /** null until checked on mount; false blocks paid submissions and retries (no cross-tab coordination). */
+  const [locksOk, setLocksOk] = useState<boolean | null>(null);
   /** Key of the POST currently in flight from this tab; independent of the editable form fields. */
   const [inFlightKey, setInFlightKey] = useState<string | null>(null);
   const inFlightRef = useRef<string | null>(null);
@@ -474,11 +573,20 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     } else if (stored) {
       storageRemove(STORAGE_KEY);
     }
-    setPendingList(listPending(pilots, lanes));
+    const scan = scanPending(pilots, lanes);
+    setPendingList(scan.records);
+    setBadSlots(scan.badSlots);
+    setScanError(scan.error);
     setStorageOk(storageWritable());
+    setLocksOk(locksSupported());
   }, [idPattern, lanes, loadConfig, pilots, resetPolling]);
 
-  const refreshPending = useCallback(() => setPendingList(listPending(pilots, lanes)), [lanes, pilots]);
+  const applyScan = useCallback((scan: PendingScan) => {
+    setPendingList(scan.records);
+    setBadSlots(scan.badSlots);
+    setScanError(scan.error);
+  }, []);
+  const refreshPending = useCallback(() => applyScan(scanPending(pilots, lanes)), [applyScan, lanes, pilots]);
 
   // Another tab added or resolved a submission: refresh the unresolved list (blocks or unblocks this tab).
   useEffect(() => {
@@ -547,8 +655,9 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
   const overDaily =
     effectiveCap !== null && config?.dailyRemainingUsd != null && Number(effectiveCap) > Number(config.dailyRemainingUsd);
   const submitting = inFlightKey !== null;
-  /** Form controls are locked while a POST is in flight or any submission is unresolved. */
-  const locked = submitting || pendingList.length > 0;
+  /** Form controls are locked while a POST is in flight or any submission is unresolved or unreadable. */
+  const blockingRecords = pendingList.length > 0 || badSlots.length > 0 || scanError;
+  const locked = submitting || blockingRecords;
   const visiblePending = pendingList.filter((record) => record.key !== inFlightKey);
 
   const canSubmit =
@@ -563,31 +672,55 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     acknowledged &&
     !submitting &&
     storageOk === true &&
-    pendingList.length === 0 &&
+    locksOk === true &&
+    !blockingRecords &&
     activeId === null;
 
+  function showError(code: string, message: string) {
+    setSubmitState({ status: 'error', error: { code, message } });
+  }
+
   /**
-   * Sends one submission. Its key and exact body are persisted in its own record (and read back)
-   * before the request leaves; if that fails nothing is sent. Only one POST per tab is in flight. The
-   * record is removed only when this submission resolves: 202 / 200 replay, `duplicate`, or a
-   * definitive 4xx that does not depend on the key. There is no way to discard it from the UI.
+   * Sends one submission. Under the records lock (storage only) the attempt is recorded: a fresh submission
+   * only if nothing unresolved exists, a retry by continuing the stored history. The fetch happens outside
+   * the lock. Resolution is decided under the lock again, from the stored state only. Nothing is sent when
+   * the lock, the storage read or the write-and-read-back fails. There is no way to discard a record.
    */
-  async function send(original: PendingSubmission) {
+  async function send(input: { kind: 'fresh'; record: PendingSubmission } | { kind: 'retry'; key: string }) {
     if (inFlightRef.current !== null) return;
-    // Recorded (uncertain, attempt counted) before the request leaves; on a failed write nothing is sent.
-    const begun = beginAttempt(original, pilots, lanes);
-    if (!begun) {
-      setStorageOk(false);
-      setSubmitState({ status: 'error', error: { code: 'storage_unavailable', message: STORAGE_REQUIRED_MESSAGE } });
-      return;
-    }
-    const { record: submission, attempt } = begun;
-    inFlightRef.current = submission.key;
-    setInFlightKey(submission.key);
-    refreshPending();
+    const key = input.kind === 'fresh' ? input.record.key : input.key;
+    inFlightRef.current = key;
+    setInFlightKey(key);
     setSubmitState({ status: 'submitting' });
     try {
-      await dispatch(submission, attempt);
+      const locked = await withRecordsLock(() =>
+        input.kind === 'fresh' ? beginFreshLocked(input.record, pilots, lanes) : beginRetryLocked(input.key, pilots, lanes)
+      );
+      if (!locked.ok) {
+        showError('lock_unavailable', locksSupported() ? LOCK_UNAVAILABLE_MESSAGE : LOCKS_MESSAGE);
+        return;
+      }
+      const begun = locked.value;
+      if (begun.kind === 'unresolved') {
+        applyScan(begun.scan);
+        showError('unresolved_submission', UNRESOLVED_MESSAGE);
+        return;
+      }
+      if (begun.kind === 'missing') {
+        showError('record_missing', RECORD_GONE_MESSAGE);
+        return;
+      }
+      if (begun.kind === 'malformed') {
+        showError('record_unreadable', RECORD_UNREADABLE_MESSAGE);
+        return;
+      }
+      if (begun.kind === 'storage') {
+        setStorageOk(false);
+        showError('storage_unavailable', STORAGE_REQUIRED_MESSAGE);
+        return;
+      }
+      refreshPending();
+      await dispatch(begun.record, begun.attempt);
     } finally {
       inFlightRef.current = null;
       setInFlightKey(null);
@@ -605,23 +738,19 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
         body: JSON.stringify({ pilot: submission.pilot, lane: submission.lane, ack_cap_usd: submission.ack_cap_usd })
       });
     } catch {
-      keepUncertain(submission, attempt, pilots, lanes);
-      setSubmitState({
-        status: 'error',
-        error: {
-          code: 'network_error',
-          message:
-            'Network error: the outcome is unknown. Use “Retry the same submission”: it reuses the same request key, so the backend cannot start a second run for it.'
-        }
-      });
+      await withRecordsLock(() => keepUncertainLocked(submission.key, pilots, lanes));
+      showError(
+        'network_error',
+        'Network error: the outcome is unknown. Use “Retry the same submission”: it reuses the same request key, so the backend cannot start a second run for it.'
+      );
       return;
     }
 
     const payload = await readJson(response);
-    const resolve = () => clearRecord(submission.key);
     const accepted = isAcceptedView(payload, idPattern) ? payload : null;
     if (accepted && (response.status === 202 || (response.status === 200 && accepted.replay === true))) {
-      resolve();
+      // The key's outcome is established. If the lock is not granted the record simply stays (safe).
+      await withRecordsLock(() => settleLocked(submission.key, attempt, 'accepted', pilots, lanes));
       startTracking(
         accepted.requestId,
         {
@@ -643,54 +772,58 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
     const outcomeUnknown = response.status >= 500 || error.code === 'unexpected_response' || response.ok;
     if (outcomeUnknown) {
       // 5xx, unreadable or unexpected answer: this dispatch's outcome is unknown too.
-      keepUncertain(submission, attempt, pilots, lanes);
+      await withRecordsLock(() => keepUncertainLocked(submission.key, pilots, lanes));
       setSubmitState({ status: 'error', error });
       return;
     }
-    if (error.code === 'duplicate' && error.requestId && idPattern.test(error.requestId) && settleIfSoleAttempt(submission.key, attempt, pilots, lanes)) {
+    const isDuplicate = error.code === 'duplicate' && !!error.requestId && idPattern.test(error.requestId);
+    const definitive = isDefinitiveRefusal(response.status, error);
+    let cleared = false;
+    if (definitive || isDuplicate) {
+      const settled = await withRecordsLock(() => settleLocked(submission.key, attempt, 'refused', pilots, lanes));
+      cleared = settled.ok && (settled.value === 'cleared' || settled.value === 'gone');
+    }
+    if (isDuplicate && cleared && error.requestId) {
       startTracking(error.requestId, { pilot: submission.pilot, lane: submission.lane, note: error.message }, true);
       setSubmitState({ status: 'idle' });
       return;
     }
-    if (isDefinitiveRefusal(response.status, error) && settleIfSoleAttempt(submission.key, attempt, pilots, lanes)) {
-      // The key's only dispatch, answer received in this page: the refusal settles it.
+    if (cleared) {
+      // The key's only dispatch, answer received in this page, stored count still 1: the refusal settles it.
       setSubmitState({ status: 'error', error });
       return;
     }
-    // Earlier or concurrent attempts exist (or the refusal depends on the key): keep the record, keep blocking.
-    const kept = isDefinitiveRefusal(response.status, error) || attempt > 1;
+    // Other attempts exist, the refusal depends on the key, or the lock was not granted: keep, keep blocking.
+    const kept = definitive || attempt > 1;
     setSubmitState({ status: 'error', error: kept ? { ...error, message: `${error.message} ${UNCERTAIN_KEPT_MESSAGE}` } : error });
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (inFlightRef.current !== null) return;
-    // Re-read storage at click time: an unresolved submission from this or another tab blocks a new one.
-    const unresolved = listPending(pilots, lanes);
-    if (unresolved.length > 0) {
-      setPendingList(unresolved);
-      setSubmitState({ status: 'error', error: { code: 'unresolved_submission', message: UNRESOLVED_MESSAGE } });
-      return;
-    }
-    // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it).
+    // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it). The authoritative
+    // "nothing unresolved exists" check runs again inside the records lock (beginFreshLocked).
     if (!canSubmit || !selectedLane || effectiveCap === null) return;
     if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-      setSubmitState({ status: 'error', error: { code: 'no_uuid', message: 'This browser cannot generate a request key.' } });
+      showError('no_uuid', 'This browser cannot generate a request key.');
       return;
     }
     await send({
-      key: crypto.randomUUID(),
-      pilot,
-      lane: selectedLane.value,
-      ack_cap_usd: effectiveCap,
-      createdAt: Date.now(),
-      uncertain: true,
-      attempts: 0
+      kind: 'fresh',
+      record: {
+        key: crypto.randomUUID(),
+        pilot,
+        lane: selectedLane.value,
+        ack_cap_usd: effectiveCap,
+        createdAt: Date.now(),
+        uncertain: true,
+        attempts: 1
+      }
     });
   }
 
   function retryPending(record: PendingSubmission) {
-    if (inFlightRef.current === null) void send(record);
+    if (inFlightRef.current === null && locksOk === true) void send({ kind: 'retry', key: record.key });
   }
 
   function dismissTracked() {
@@ -764,6 +897,20 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           </button>
         </section>
 
+        {(badSlots.length > 0 || scanError) && (
+          <section aria-label="Unreadable submission record" className="v4s-pending v4s-bad">
+            <h2 className="v4s-label">Submission record that can&apos;t be read safely</h2>
+            <p className="v4s-message">
+              {scanError
+                ? 'Stored submission records could not be read.'
+                : `Unreadable or mismatched record${badSlots.length > 1 ? 's' : ''}: ${badSlots.join(', ')}`}
+            </p>
+            <p className="v4s-muted">
+              New runs are blocked from this browser. An operator must check the backend before this browser&apos;s site data is
+              cleared.
+            </p>
+          </section>
+        )}
         {visiblePending.map((record) => {
           const recordLane = laneOption(record.lane);
           return (
@@ -785,7 +932,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
                 instead of starting a second one.
               </p>
               <div className="v4s-actions">
-                <button className="v4s-link" disabled={submitting} onClick={() => retryPending(record)} type="button">
+                <button className="v4s-link" disabled={submitting || locksOk !== true} onClick={() => retryPending(record)} type="button">
                   Retry the same submission
                 </button>
               </div>
@@ -895,6 +1042,7 @@ export default function V4StagingForm({ pilots, lanes, requestIdPattern }: Props
           </button>
 
           {storageOk === false && <p className="notice error">{STORAGE_REQUIRED_MESSAGE}</p>}
+          {locksOk === false && <p className="notice error v4s-locks">{LOCKS_MESSAGE}</p>}
           {visiblePending.length > 0 && <p className="v4s-muted">Retry the earlier submission first; new runs are blocked until it resolves.</p>}
           {activeId !== null && <p className="v4s-muted">A run is being tracked below; submit again when it has finished.</p>}
 
