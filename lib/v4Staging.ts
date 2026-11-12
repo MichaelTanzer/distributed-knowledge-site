@@ -66,9 +66,10 @@ export const PILOTS: readonly PilotOption[] = [
 ];
 
 /**
- * Case descriptions shown under the KIQ drop-down (edit the text here). Written only from the PUBLIC fields of
- * the frozen setups (`content.resolution.setup.public`: `topic`, `what_question`, `so_what_question`), which the
- * expert packet shows the test-taker. Nothing from hidden fields: no candidate explanations, answers,
+ * Case descriptions shown under the KIQ drop-down (edit the text here; MT approved this text on 2026-11-12). Written
+ * only from the PUBLIC fields of the frozen setups (`content.resolution.setup.public`: `topic`, `what_question`,
+ * `so_what_question`, and for SL-028 the public background claim that Pellam suffered repeated regional power
+ * interruptions), which the expert packet shows the test-taker. Nothing from hidden fields: no candidate explanations, answers,
  * mechanisms, culprits, sponsors or scoring. The names are the scenarios' fictional names.
  */
 export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = {
@@ -80,7 +81,7 @@ export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = 
   'SL-028': {
     title: 'Critical-infrastructure disruption',
     summary:
-      "Within 21 days, assess what caused the repeated interruptions of Pellam and, if any interference occurred, who carried it out and whether a foreign state was involved. Then weigh the Principals' options under each explanation."
+      "Within 21 days, assess what caused the repeated power interruptions in Pellam and, if any interference occurred, who carried it out and whether a foreign state was involved. Then weigh the Principals' options under each explanation."
   },
   'SL-035': {
     title: 'Security-service reshuffle in Iskar',

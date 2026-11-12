@@ -12,10 +12,11 @@ describe('case descriptions under the KIQ drop-down', () => {
   });
 
   for (const [pilot, description] of Object.entries(CASE_DESCRIPTIONS)) {
-    it(`${pilot}: a short title and one or two sentences of at most 35 words`, () => {
+    // The brief asks for "about 35 words at most"; MT approved the SL-028 wording at 36 words (2026-11-12).
+    it(`${pilot}: a short title and one or two sentences of about 35 words (at most 36)`, () => {
       assert.ok(description.title.trim().length > 0);
       assert.ok(words(description.title) <= 6, `title has ${words(description.title)} words`);
-      assert.ok(words(description.summary) <= 35, `summary has ${words(description.summary)} words`);
+      assert.ok(words(description.summary) <= 36, `summary has ${words(description.summary)} words`);
       const count = sentences(description.summary);
       assert.ok(count >= 1 && count <= 2, `summary has ${count} sentences`);
       assert.equal(description.title, description.title.trim());
