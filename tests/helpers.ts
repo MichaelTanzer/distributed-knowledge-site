@@ -24,8 +24,78 @@ export const FOUR_LANES: BackendLane[] = [
   }
 ];
 
+const LEGACY_VALID = FOUR_LANES.slice(0, 3);
+const ANTHROPIC = FOUR_LANES[3] as BackendLane;
+
+function omit(entry: BackendLane, key: string): BackendLane {
+  const copy = { ...entry };
+  delete copy[key];
+  return copy;
+}
+
+function withAnthropic(...entries: BackendLane[]): BackendLane[] {
+  return [...LEGACY_VALID, ...entries];
+}
+
+export interface LaneCase {
+  name: string;
+  /** The `lanes` field of /v1/config. */
+  lanes: unknown;
+}
+
+/**
+ * Configs that must NOT offer anthropic (fail closed); the three legacy lanes in them are valid. A route request
+ * for anthropic with any of them must be refused without calling POST /v1/requests.
+ */
+export const ANTHROPIC_NOT_OFFERED: LaneCase[] = [
+  { name: 'unavailablePilots missing', lanes: withAnthropic(omit(ANTHROPIC, 'unavailablePilots')) },
+  { name: 'unavailablePilots is a string', lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: 'SL-028' }) },
+  { name: 'unavailablePilots is null', lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: null }) },
+  { name: 'unavailablePilots has an unknown case id', lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: ['SL-028', 'SL-999'] }) },
+  { name: 'unavailablePilots has a non-string', lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: ['SL-028', 7] }) },
+  { name: 'capUsd missing', lanes: withAnthropic(omit(ANTHROPIC, 'capUsd')) },
+  { name: 'capUsd is a number', lanes: withAnthropic({ ...ANTHROPIC, capUsd: 12 }) },
+  { name: 'capUsd is not a two-decimal string', lanes: withAnthropic({ ...ANTHROPIC, capUsd: '12' }) },
+  { name: 'generatorModel missing', lanes: withAnthropic(omit(ANTHROPIC, 'generatorModel')) },
+  { name: 'generatorModel of another family', lanes: withAnthropic({ ...ANTHROPIC, generatorModel: 'gpt-6-astra' }) },
+  { name: 'generatorModel not a plain id', lanes: withAnthropic({ ...ANTHROPIC, generatorModel: 'claude opus <b>' }) },
+  {
+    name: 'listed twice: open with cap 12.00, then SL-028 unavailable with cap 13.00',
+    lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: [] }, { ...ANTHROPIC, capUsd: '13.00' })
+  },
+  { name: 'listed twice, identical entries', lanes: withAnthropic(ANTHROPIC, ANTHROPIC) },
+  { name: 'keyed form with scalar caps', lanes: { openai: '13.50', google: '13.50', xai: '8.75', anthropic: '12.00' } },
+  {
+    name: 'keyed form with full entries',
+    lanes: {
+      openai: { capUsd: '13.50' },
+      google: { capUsd: '13.50' },
+      xai: { capUsd: '8.75' },
+      anthropic: { ...ANTHROPIC, unavailablePilots: [] }
+    }
+  }
+];
+
+/** Configs whose openai entry is malformed: openai must not be offered (the other lanes stay valid). */
+export const OPENAI_NOT_OFFERED: LaneCase[] = [
+  { name: 'unavailablePilots is a string', lanes: [{ ...FOUR_LANES[0], unavailablePilots: 'SL-028' }, ...FOUR_LANES.slice(1)] },
+  { name: 'unavailablePilots has an unknown case id', lanes: [{ ...FOUR_LANES[0], unavailablePilots: ['SL-999'] }, ...FOUR_LANES.slice(1)] },
+  { name: 'capUsd is a number', lanes: [{ ...FOUR_LANES[0], capUsd: 13.5 }, ...FOUR_LANES.slice(1)] },
+  { name: 'capUsd missing', lanes: [omit(FOUR_LANES[0] as BackendLane, 'capUsd'), ...FOUR_LANES.slice(1)] }
+];
+
+/**
+ * A legacy lane listed twice keeps origin/main's behaviour: offered without site-side restriction, static model,
+ * and the last valid cap among its entries (here 14.00), as origin/main's laneCapsFrom chose it.
+ */
+export const OPENAI_LISTED_TWICE: unknown[] = [
+  { ...FOUR_LANES[0], unavailablePilots: ['SL-028'], capUsd: '13.50' },
+  { lane: 'openai', generatorModel: 'gpt-other', capUsd: '14.00' },
+  ...FOUR_LANES.slice(1)
+];
+
 /** A `/v1/config` body shaped like the staging backend's, including fields the site must not pass through. */
-export function backendConfig(lanes: unknown[] | undefined): Record<string, unknown> {
+export function backendConfig(lanes: unknown): Record<string, unknown> {
   const config: Record<string, unknown> = {
     service: 'dk-v4-staging',
     s1: 'f5b229fabcdef0123456789abcdef0123456789a',

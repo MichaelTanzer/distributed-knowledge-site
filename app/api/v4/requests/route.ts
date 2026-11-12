@@ -21,7 +21,7 @@ import {
   stagingNotFound,
   v4Enabled
 } from '../../../../lib/v4Staging';
-import { isPairUnavailable } from '../../../../lib/v4Lanes';
+import { isPairUnavailable, offeredLaneValues } from '../../../../lib/v4Lanes';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -84,16 +84,18 @@ export async function POST(request: NextRequest) {
   } catch {
     view = null;
   }
-  // Only what the backend offers: a lane it does not list, or a lane/case pair it marks unavailable, is refused
-  // here (a definitive 400) without calling POST /v1/requests. The backend refuses the pair too.
-  if (view && view.lanes !== null) {
-    if (!view.lanes.some((entry) => entry.lane === parsed.body.lane)) {
-      return refuse(400, 'lane_unavailable', 'The backend does not offer this lane.');
-    }
-    if (isPairUnavailable(view.lanes, parsed.body.lane, parsed.body.pilot)) {
-      return refuse(400, 'lane_pilot_unavailable', 'This lane is not available for this pilot.');
-    }
+  // Only what the backend offers, by the same rules as the form (lib/v4Lanes.ts): a lane the config does not
+  // offer (malformed, duplicated or missing entry; without per-lane data only the legacy three are offered), or a
+  // lane/case pair it marks unavailable, is refused here (a definitive 400) without calling POST /v1/requests.
+  // The backend refuses the pair too.
+  const offered = view?.lanes ?? null;
+  if (!offeredLaneValues(offered).includes(parsed.body.lane)) {
+    return refuse(400, 'lane_unavailable', 'The backend does not offer this lane.');
   }
+  if (isPairUnavailable(offered, parsed.body.lane, parsed.body.pilot)) {
+    return refuse(400, 'lane_pilot_unavailable', 'This lane is not available for this pilot.');
+  }
+  // The cap comes from the same entry that made the lane offered (or, without per-lane data, as origin/main read it).
   const ackCapUsd = view?.laneCapsUsd[parsed.body.lane] ?? null;
   if (!ackCapUsd) {
     return refuse(503, 'v4_unavailable', 'The staging backend did not report a reservation cap for this lane.');

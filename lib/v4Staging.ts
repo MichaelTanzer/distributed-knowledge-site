@@ -10,7 +10,15 @@
 import { isIP } from 'node:net';
 import { NextResponse } from 'next/server';
 import { operatorPreview, v4Enabled } from './v4Env';
-import { LANE_VALUES as KNOWN_LANE_VALUES, type ConfigLaneView, type LaneValue, type PilotValue } from './v4Lanes';
+import {
+  LANE_VALUES as KNOWN_LANE_VALUES,
+  LEGACY_LANE_VALUES,
+  isLegacyLane,
+  plausibleModel,
+  type ConfigLaneView,
+  type LaneValue,
+  type PilotValue
+} from './v4Lanes';
 
 export { operatorPreview, v4Enabled };
 export type { ConfigLaneView, LaneValue, PilotValue };
@@ -374,65 +382,77 @@ function spendStateFrom(source: JsonObject): SpendState {
   return 'unknown';
 }
 
-function laneCapsFrom(value: unknown): Partial<Record<LaneValue, string>> {
-  const f = BACKEND_FIELDS.config;
-  const caps: Partial<Record<LaneValue, string>> = {};
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      if (!isObject(entry)) continue;
-      const lane = pick(entry, f.laneId);
-      const cap = usd(pick(entry, f.laneCapUsd));
-      if (isLane(lane) && cap) caps[lane] = cap;
-    }
-  } else if (isObject(value)) {
-    for (const lane of LANE_VALUES) {
-      const entry = value[lane];
-      const cap = isObject(entry) ? usd(pick(entry, f.laneCapUsd)) : usd(entry);
-      if (cap) caps[lane as LaneValue] = cap;
-    }
-  }
-  return caps;
+/** A cap exactly as the backend writes it and as `ack_cap_usd` is sent: a two-decimal string such as "13.50". */
+const CAP_PATTERN = /^\d{1,4}\.\d{2}$/;
+
+function capString(value: unknown): string | null {
+  return typeof value === 'string' && CAP_PATTERN.test(value) ? value : null;
 }
 
-/** A plain model id (letters, digits, `.`, `_`, `:`, `-`; at most 64 characters), else null. */
-function modelId(value: unknown): string | null {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value) ? value : null;
+/** The known case ids of a well-formed `unavailablePilots` (an array of known case ids only), else null. */
+function unavailablePilotsFrom(value: unknown): PilotValue[] | null {
+  if (!Array.isArray(value) || !value.every(isPilot)) return null;
+  return [...new Set(value)];
 }
 
-/** Known case ids from `unavailablePilots`, deduplicated; anything that is not an array counts as none. */
-function unavailablePilotsFrom(value: unknown): PilotValue[] {
-  if (!Array.isArray(value)) return [];
-  const pilots: PilotValue[] = [];
-  for (const item of value) if (isPilot(item) && !pilots.includes(item)) pilots.push(item);
-  return pilots;
+interface LaneAnalysis {
+  /** Offered lanes; null when the backend gives no per-lane data (the legacy three are then offered). */
+  lanes: ConfigLaneView[] | null;
+  /** Caps the route may acknowledge, each from the same entry that made its lane offered. */
+  caps: Partial<Record<LaneValue, string>>;
 }
 
 /**
- * The backend's `lanes` (an array of {lane, generatorModel, unavailablePilots, ...}; an object keyed by lane is
- * also read, like laneCapsFrom). Only lanes the site knows are kept, the first entry per lane wins, and only
- * the lane, model and unavailable cases are kept. null when the field is missing or not an array or object.
+ * Reads the backend's `lanes`, failing closed. Only the declared array form can offer a lane:
+ * - a lane listed exactly once is offered only if its entry is well formed: a cap string (`capUsd`, e.g.
+ *   "12.00") and `unavailablePilots` that is an array of known case ids. `unavailablePilots` may be absent only
+ *   for the legacy lanes (today's three-lane backend sends none); a non-legacy lane also needs a generator
+ *   model of its own family. Its model, restrictions and cap all come from that one entry. A malformed entry
+ *   offers nothing and supplies no cap;
+ * - a legacy lane listed more than once keeps origin/main's behaviour: it is offered without site-side
+ *   restrictions (the backend still enforces its own), shows the static model name, and its cap is the last
+ *   valid cap among its entries, exactly as origin/main's laneCapsFrom chose it. Any other lane listed more than
+ *   once is not offered;
+ * - unknown lanes and non-object entries are ignored.
+ * An object keyed by lane (origin/main also read it) offers nothing new: `lanes` is null, so only the legacy
+ * three are offered, with their caps read as origin/main read them; no other lane gets a cap. A missing or
+ * scalar `lanes` gives null and no caps.
  */
-function configLanesFrom(value: unknown): ConfigLaneView[] | null {
+function lanesFrom(value: unknown): LaneAnalysis {
   const f = BACKEND_FIELDS.config;
-  const entries: Array<[unknown, unknown]> = [];
-  if (Array.isArray(value)) {
-    for (const entry of value) if (isObject(entry)) entries.push([pick(entry, f.laneId), entry]);
-  } else if (isObject(value)) {
-    for (const [lane, entry] of Object.entries(value)) entries.push([lane, entry]);
-  } else {
-    return null;
+  const caps: Partial<Record<LaneValue, string>> = {};
+  if (isObject(value)) {
+    for (const lane of LEGACY_LANE_VALUES) {
+      const entry = value[lane];
+      const cap = isObject(entry) ? usd(pick(entry, f.laneCapUsd)) : usd(entry);
+      if (cap) caps[lane] = cap;
+    }
+    return { lanes: null, caps };
   }
+  if (!Array.isArray(value)) return { lanes: null, caps };
   const lanes: ConfigLaneView[] = [];
-  for (const [lane, entry] of entries) {
-    if (!isLane(lane) || lanes.some((item) => item.lane === lane)) continue;
-    const source = isObject(entry) ? entry : {};
-    lanes.push({
-      lane,
-      model: modelId(pick(source, f.laneGeneratorModel)),
-      unavailablePilots: unavailablePilotsFrom(pick(source, f.laneUnavailablePilots))
-    });
+  for (const lane of KNOWN_LANE_VALUES) {
+    const entries = value.filter((entry): entry is JsonObject => isObject(entry) && pick(entry, f.laneId) === lane);
+    if (entries.length === 0) continue;
+    if (entries.length > 1) {
+      if (!isLegacyLane(lane)) continue;
+      lanes.push({ lane, model: null, unavailablePilots: [] });
+      for (const entry of entries) {
+        const cap = usd(pick(entry, f.laneCapUsd));
+        if (cap) caps[lane] = cap;
+      }
+      continue;
+    }
+    const entry = entries[0] as JsonObject;
+    const cap = capString(pick(entry, f.laneCapUsd));
+    const rawPilots = pick(entry, f.laneUnavailablePilots);
+    const unavailable = rawPilots === undefined && isLegacyLane(lane) ? [] : unavailablePilotsFrom(rawPilots);
+    const model = plausibleModel(lane, pick(entry, f.laneGeneratorModel));
+    if (!cap || !unavailable || (!isLegacyLane(lane) && model === null)) continue;
+    lanes.push({ lane, model, unavailablePilots: unavailable });
+    caps[lane] = cap;
   }
-  return lanes;
+  return { lanes, caps };
 }
 
 export function normalizeConfig(raw: unknown): StagingConfigView {
@@ -445,6 +465,7 @@ export function normalizeConfig(raw: unknown): StagingConfigView {
   }
   const sha = pick(source, f.backendSha);
   const day = pick(source, f.dayUtc);
+  const lanes = lanesFrom(pick(source, f.lanes));
   return {
     recipient,
     dailyRemainingUsd: usd(pick(source, f.dailyRemainingUsd)),
@@ -455,8 +476,8 @@ export function normalizeConfig(raw: unknown): StagingConfigView {
     spendState: spendStateFrom(source),
     runInProgress: bool(pick(source, f.runInProgress)),
     reconciliationRequired: bool(pick(source, f.reconciliationRequired)),
-    laneCapsUsd: laneCapsFrom(pick(source, f.lanes)),
-    lanes: configLanesFrom(pick(source, f.lanes)),
+    laneCapsUsd: lanes.caps,
+    lanes: lanes.lanes,
     backendSha: typeof sha === 'string' && /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12) : null
   };
 }
