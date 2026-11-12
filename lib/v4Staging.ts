@@ -98,8 +98,8 @@ export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = 
  * page's expected reservation cap.
  */
 export const LANES: readonly LaneOption[] = [
-  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '13.50', typicalRuntime: '~20 min' },
-  { value: 'google', provider: 'Google', model: 'gemini-4-carbon', capUsd: '13.50', typicalRuntime: '~20–25 min' },
+  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '15.00', typicalRuntime: '~20 min' },
+  { value: 'google', provider: 'Google', model: 'gemini-4-carbon', capUsd: '15.00', typicalRuntime: '~20–25 min' },
   { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' },
   { value: 'anthropic', provider: 'Anthropic', model: 'claude-opus-5-5', capUsd: '12.00', typicalRuntime: '~25 min' }
 ];
@@ -386,7 +386,7 @@ function spendStateFrom(source: JsonObject): SpendState {
   return 'unknown';
 }
 
-/** A cap exactly as the backend writes it and as `ack_cap_usd` is sent: a two-decimal string such as "13.50". */
+/** A cap exactly as the backend writes it and as `ack_cap_usd` is sent: a two-decimal string such as "15.00". */
 const CAP_PATTERN = /^\d{1,4}\.\d{2}$/;
 
 function capString(value: unknown): string | null {

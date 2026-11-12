@@ -90,7 +90,7 @@ describe('POST /api/v4/requests: unavailable pairs and the fourth lane', () => {
     const backend = setup(backendConfig(FOUR_LANES));
     const response = await POST(submitRequest({ pilot: 'SL-028', lane: 'openai', recipient: 'reader@example.org' }));
     assert.equal(response.status, 202);
-    assert.equal(JSON.parse(backend.calls[1]?.body ?? '').ack_cap_usd, '13.50');
+    assert.equal(JSON.parse(backend.calls[1]?.body ?? '').ack_cap_usd, '15.00');
   });
 
   it("refuses anthropic with 400 lane_unavailable while the backend lists only today's three lanes", async () => {
@@ -98,6 +98,8 @@ describe('POST /api/v4/requests: unavailable pairs and the fourth lane', () => {
   });
 
   it("leaves today's three lanes unchanged against today's backend", async () => {
+    // Today's backend still caps openai and google at 13.50: ack_cap_usd is that backend value, never the page's
+    // expected 15.00 (lib/v4Staging.ts LANES).
     for (const [lane, cap] of [
       ['openai', '13.50'],
       ['google', '13.50'],
@@ -148,10 +150,10 @@ describe('POST /api/v4/requests: malformed or duplicated lane data fails closed 
   });
 
   it('with the keyed form, a legacy lane keeps origin/main behaviour: POST with its keyed cap', async () => {
-    const backend = setup(backendConfig({ openai: '13.50', google: '13.50', xai: '8.75', anthropic: '12.00' }));
+    const backend = setup(backendConfig({ openai: '15.00', google: '15.00', xai: '8.75', anthropic: '12.00' }));
     const response = await POST(submitRequest({ pilot: 'SL-002', lane: 'openai', recipient: 'reader@example.org' }));
     assert.equal(response.status, 202);
-    assert.equal(JSON.parse(backend.calls[1]?.body ?? '').ack_cap_usd, '13.50');
+    assert.equal(JSON.parse(backend.calls[1]?.body ?? '').ack_cap_usd, '15.00');
   });
 
   it("a legacy lane listed twice keeps origin/main's behaviour: dispatched with the last valid cap", async () => {

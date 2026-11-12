@@ -50,9 +50,9 @@ describe('normalizeConfig lanes (fail closed)', () => {
   }
 
   it('the keyed form offers nothing new: lanes null, legacy caps read as origin/main read them', () => {
-    const view = normalizeConfig(backendConfig({ openai: '13.50', google: { capUsd: 13.5 }, xai: '8.75', anthropic: '12.00' }));
+    const view = normalizeConfig(backendConfig({ openai: '15.00', google: { capUsd: 15 }, xai: '8.75', anthropic: '12.00' }));
     assert.equal(view.lanes, null);
-    assert.deepEqual(view.laneCapsUsd, { openai: '13.50', google: '13.50', xai: '8.75' });
+    assert.deepEqual(view.laneCapsUsd, { openai: '15.00', google: '15.00', xai: '8.75' });
   });
 
   for (const { name, lanes } of OPENAI_NOT_OFFERED) {
@@ -73,7 +73,7 @@ describe('normalizeConfig lanes (fail closed)', () => {
     const lanes = [{ ...FOUR_LANES[0], generatorModel: 'claude-opus-5-5' }, ...FOUR_LANES.slice(1)];
     const view = normalizeConfig(backendConfig(lanes));
     assert.deepEqual(view.lanes?.[0], { lane: 'openai', model: null, unavailablePilots: [] });
-    assert.equal(view.laneCapsUsd.openai, '13.50');
+    assert.equal(view.laneCapsUsd.openai, '15.00');
   });
 
   it('ignores unknown lanes and non-object entries; empty or unknown-only lists offer nothing', () => {
@@ -130,7 +130,7 @@ describe('GET /api/v4/config passes through exactly what the form needs', () => 
       for (const key of ['dailyRemainingUsd', 'dailyCapUsd', 'totalRemainingUsd', 'totalCapUsd', 'dayUtc', 'recipient', 'backendSha']) {
         assert.equal(body[key], null, key);
       }
-      for (const hidden of ['reviewer-model', 'timeoutSeconds', 'internal-host', 'spendEnforcement', 'Used', '13.50', '12.00', '8.75', '127.0.0.1']) {
+      for (const hidden of ['reviewer-model', 'timeoutSeconds', 'internal-host', 'spendEnforcement', 'Used', '15.00', '12.00', '8.75', '127.0.0.1']) {
         assert.equal(text.includes(hidden), false, hidden);
       }
       assert.deepEqual(backend.calls.map((call) => `${call.method} ${call.path}`), ['GET /v1/config']);
@@ -145,7 +145,7 @@ describe('GET /api/v4/config passes through exactly what the form needs', () => 
     const text = await response.text();
     const body = JSON.parse(text) as Record<string, unknown>;
     assert.deepEqual(Object.keys(body).sort(), VIEW_KEYS);
-    assert.deepEqual(body.laneCapsUsd, { openai: '13.50', google: '13.50', xai: '8.75', anthropic: '12.00' });
+    assert.deepEqual(body.laneCapsUsd, { openai: '15.00', google: '15.00', xai: '8.75', anthropic: '12.00' });
     for (const hidden of ['reviewer-model', 'timeoutSeconds', 'internal-host', 'spendEnforcement']) {
       assert.equal(text.includes(hidden), false, hidden);
     }

@@ -213,6 +213,55 @@ describe('v4 form with the config loaded: malformed or duplicated lane data', ()
   });
 });
 
+describe('operator lane radios: backend cap against the expected cap', () => {
+  /** The radios once the config has loaded, with the caps of the operator (Preview) config view. */
+  function renderWithBackendCaps(lanes: unknown) {
+    const view = normalizeConfig(backendConfig(lanes));
+    return radios(
+      renderToStaticMarkup(
+        <LaneRadios
+          caps={view.laneCapsUsd}
+          choices={laneChoices(LANES, view.lanes, 'SL-002')}
+          disabled={false}
+          onSelect={() => undefined}
+          value=""
+        />
+      )
+    );
+  }
+
+  it('expects 15.00 for openai and google, 8.75 for xai and 12.00 for anthropic', () => {
+    assert.deepEqual(Object.fromEntries(LANES.map((lane) => [lane.value, lane.capUsd])), {
+      openai: '15.00',
+      google: '15.00',
+      xai: '8.75',
+      anthropic: '12.00'
+    });
+  });
+
+  it('a backend cap equal to the expected cap is shown without a warning (the S6 backend)', () => {
+    const rendered = renderWithBackendCaps(FOUR_LANES);
+    assert.deepEqual(rendered.map((radio) => radio.value), ['openai', 'google', 'xai', 'anthropic']);
+    for (const radio of rendered) {
+      const expected = LANES.find((lane) => lane.value === radio.value)?.capUsd ?? '';
+      assert.ok(radio.label.includes(`Reservation cap $${expected} per run`), radio.label);
+      assert.doesNotMatch(radio.label, /differs from the expected/, radio.value);
+    }
+  });
+
+  it("a different backend cap is shown with the warning (today's backend: 13.50 on openai and google)", () => {
+    const rendered = renderWithBackendCaps(THREE_LANES);
+    for (const lane of ['openai', 'google']) {
+      const label = rendered.find((radio) => radio.value === lane)?.label ?? '';
+      assert.match(label, /Reservation cap \$13\.50 per run/, lane);
+      assert.match(label, /Backend reservation cap differs from the expected \$15\.00\./, lane);
+    }
+    const xai = rendered.find((radio) => radio.value === 'xai')?.label ?? '';
+    assert.match(xai, /Reservation cap \$8\.75 per run/);
+    assert.doesNotMatch(xai, /differs from the expected/);
+  });
+});
+
 describe('submitted and earlier requests (pending and status panels)', () => {
   it('are labelled with the provider name only, never a model name', () => {
     assert.deepEqual(

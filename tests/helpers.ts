@@ -4,16 +4,21 @@ export const REQUEST_ID = '0123456789abcdef0123456789abcdef';
 
 type BackendLane = Record<string, unknown>;
 
-/** Today's backend (before the Anthropic deploy): three lanes, no `unavailablePilots`. */
+/** Today's backend (S5, before the S6 deploy): three lanes, no `unavailablePilots`, openai and google capped at 13.50. */
 export const THREE_LANES: BackendLane[] = [
   { lane: 'openai', generatorModel: 'gpt-6-astra', reviewerModel: 'reviewer-model-a', capUsd: '13.50', timeoutSeconds: 3000 },
   { lane: 'google', generatorModel: 'gemini-test-model', reviewerModel: 'reviewer-model-b', capUsd: '13.50', timeoutSeconds: 3000 },
   { lane: 'xai', generatorModel: 'grok-4.7', reviewerModel: 'reviewer-model-c', capUsd: '8.75', timeoutSeconds: 6000 }
 ];
 
-/** The backend after the Anthropic deploy: four lanes, `unavailablePilots` on every lane, anthropic:SL-028 off. */
+/**
+ * The backend after the S6 deploy: four lanes, `unavailablePilots` on every lane, anthropic:SL-028 off, and the
+ * openai and google caps raised from 13.50 to 15.00 (xai stays 8.75).
+ */
 export const FOUR_LANES: BackendLane[] = [
-  ...THREE_LANES.map((lane) => ({ ...lane, unavailablePilots: [] })),
+  { ...THREE_LANES[0], capUsd: '15.00', unavailablePilots: [] },
+  { ...THREE_LANES[1], capUsd: '15.00', unavailablePilots: [] },
+  { ...THREE_LANES[2], unavailablePilots: [] },
   {
     lane: 'anthropic',
     generatorModel: 'claude-opus-5-5',
@@ -64,12 +69,12 @@ export const ANTHROPIC_NOT_OFFERED: LaneCase[] = [
     lanes: withAnthropic({ ...ANTHROPIC, unavailablePilots: [] }, { ...ANTHROPIC, capUsd: '13.00' })
   },
   { name: 'listed twice, identical entries', lanes: withAnthropic(ANTHROPIC, ANTHROPIC) },
-  { name: 'keyed form with scalar caps', lanes: { openai: '13.50', google: '13.50', xai: '8.75', anthropic: '12.00' } },
+  { name: 'keyed form with scalar caps', lanes: { openai: '15.00', google: '15.00', xai: '8.75', anthropic: '12.00' } },
   {
     name: 'keyed form with full entries',
     lanes: {
-      openai: { capUsd: '13.50' },
-      google: { capUsd: '13.50' },
+      openai: { capUsd: '15.00' },
+      google: { capUsd: '15.00' },
       xai: { capUsd: '8.75' },
       anthropic: { ...ANTHROPIC, unavailablePilots: [] }
     }
@@ -80,7 +85,7 @@ export const ANTHROPIC_NOT_OFFERED: LaneCase[] = [
 export const OPENAI_NOT_OFFERED: LaneCase[] = [
   { name: 'unavailablePilots is a string', lanes: [{ ...FOUR_LANES[0], unavailablePilots: 'SL-028' }, ...FOUR_LANES.slice(1)] },
   { name: 'unavailablePilots has an unknown case id', lanes: [{ ...FOUR_LANES[0], unavailablePilots: ['SL-999'] }, ...FOUR_LANES.slice(1)] },
-  { name: 'capUsd is a number', lanes: [{ ...FOUR_LANES[0], capUsd: 13.5 }, ...FOUR_LANES.slice(1)] },
+  { name: 'capUsd is a number', lanes: [{ ...FOUR_LANES[0], capUsd: 15 }, ...FOUR_LANES.slice(1)] },
   { name: 'capUsd missing', lanes: [omit(FOUR_LANES[0] as BackendLane, 'capUsd'), ...FOUR_LANES.slice(1)] }
 ];
 
@@ -89,7 +94,7 @@ export const OPENAI_NOT_OFFERED: LaneCase[] = [
  * and the last valid cap among its entries (here 14.00), as origin/main's laneCapsFrom chose it.
  */
 export const OPENAI_LISTED_TWICE: unknown[] = [
-  { ...FOUR_LANES[0], unavailablePilots: ['SL-028'], capUsd: '13.50' },
+  { ...FOUR_LANES[0], unavailablePilots: ['SL-028'], capUsd: '15.00' },
   { lane: 'openai', generatorModel: 'gpt-other', capUsd: '14.00' },
   ...FOUR_LANES.slice(1)
 ];
