@@ -33,15 +33,23 @@ Rollback: remove the `DK_V4_*` variables from the environment and redeploy; `/ge
 
 Operational note: the route sends the backend's current lane cap as `ack_cap_usd`, and the backend binds an idempotency key to the whole body. If a lane cap changes while a submission is unresolved, its retry gets `409 idempotency_conflict`; the browser keeps the record (it never discards an unresolved submission) and asks the requester to contact Distributed Knowledge. Change lane caps only when no submission is pending.
 
-The v4 form asks for the requester's email, a KIQ (SL-002 / SL-028 / SL-035) and a provider (OpenAI, Google, xAI or Anthropic). The expert packet is emailed to the requester.
+The v4 form asks for the requester's email, a KIQ (SL-002 / SL-028 / SL-035) and a provider (OpenAI, Google, xAI or Anthropic). The expert packet is emailed to the requester. Requests survive lost responses and reloads: each submission's idempotency key and exact body (including the email) are stored in the browser's IndexedDB before it is sent, retries reuse them, and every record change is serialised across tabs with a Web Lock. Browsers without Web Locks or usable storage cannot submit.
 
 - **Providers come from the backend, failing closed.** The form and `POST /api/v4/requests` use the same rules (`lib/v4Lanes.ts`; the parsing is `lanesFrom` in `lib/v4Staging.ts`):
-  - A lane is offered only by exactly one well-formed entry in the `GET /v1/config` `lanes` array: a two-decimal cap string (`capUsd`, which is also the `ack_cap_usd` sent), and `unavailablePilots` as an array of known KIQ ids. Only the legacy three (OpenAI, Google, xAI) may omit `unavailablePilots`. Anthropic also needs a `claude-` generator model. A malformed entry offers nothing.
-  - While the config is loading or unavailable, or when `lanes` is missing or keyed by lane, only the legacy three are offered (origin/main's behaviour), never Anthropic.
-  - A legacy lane listed twice also keeps origin/main's behaviour: offered, with the last valid cap and no site-side restriction (the backend still enforces its own). Any other lane listed twice is not offered.
-  - A config-supplied model name is shown only if it belongs to the lane's family (`gpt-`, `gemini-`, `grok-`, `claude-`); otherwise the static name in `LANES` is shown. Earlier requests (pending and status panels) always show the static name.
-  - A lane whose `unavailablePilots` contains the selected KIQ is shown disabled with "Not available for this case" and can't be submitted, and a previous selection of it is cleared.
-- **Case descriptions.** Under the KIQ drop-down the form shows a short description of the selected case (`aria-describedby` on the select). The text is the `CASE_DESCRIPTIONS` table in `lib/v4Staging.ts`, written only from the public topic and questions of each frozen setup. Requests survive lost responses and reloads: each submission's idempotency key and exact body (including the email) are stored in the browser's IndexedDB before it is sent, retries reuse them, and every record change is serialised across tabs with a Web Lock. Browsers without Web Locks or usable storage cannot submit.
+  - **One-entry rule.** A lane is offered only when exactly one entry for it appears in the `GET /v1/config` `lanes` array and that entry is well formed:
+    - a two-decimal cap string (`capUsd`, which is also the `ack_cap_usd` sent);
+    - `unavailablePilots` as an array of known KIQ ids;
+    - for Anthropic (and any future lane), a generator model of its own family (`claude-`).
+
+    The lane's model, restrictions and cap all come from that one entry. A malformed entry offers nothing and supplies no cap. A lane the rules don't offer is refused with `400 lane_unavailable`, without calling `POST /v1/requests`.
+  - **Legacy-lane exceptions.** Only OpenAI, Google and xAI have these. They keep origin/main's behaviour wherever the backend gives no usable per-lane data:
+    - they may omit `unavailablePilots` (today's backend sends none);
+    - while the config is loading or unavailable, or when `lanes` is missing or keyed by lane, these three are offered and Anthropic never is. Keyed caps are read as origin/main read them;
+    - a legacy lane listed more than once is still offered, with the last valid cap among its entries and no site-side restriction; the backend still enforces its own. Any other lane listed more than once is not offered.
+  - **Model names.** A config-supplied model is shown only if it belongs to the lane's family (`gpt-`, `gemini-`, `grok-`, `claude-`). Otherwise the form shows the static fallback, `model` in `LANES` (Google: `gemini-4-carbon`).
+  - **Earlier requests.** The pending and status panels show `pastModel`, origin/main's names (Google: `gemini-4-argon`). Neither the stored record nor the backend's status says which model ran, so history is never relabelled.
+  - **Unavailable pairs.** A lane whose `unavailablePilots` contains the selected KIQ is shown disabled with "Not available for this case" and can't be submitted. A previous selection of it is cleared.
+- **Case descriptions.** Under the KIQ drop-down the form shows a short description of the selected case (`aria-describedby` on the select). The text is the `CASE_DESCRIPTIONS` table in `lib/v4Staging.ts`. It is written only from public fields of each frozen setup: the topic and the what and so-what questions, plus, for SL-028, the public background claims (Pellam "has suffered repeated regional power interruptions").
 
 ## v4 operator page (Preview only)
 
