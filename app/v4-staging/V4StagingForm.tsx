@@ -1126,7 +1126,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
           >
             <h2 className="v4s-label">{copy.pendingTitle}</h2>
             <p className="v4s-message">
-              {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.model}` : record.lane} · for{' '}
+              {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.pastModel}` : record.lane} · for{' '}
               {record.recipient} · first sent {new Date(record.createdAt).toLocaleString()}
             </p>
             <p className="v4s-muted">{copy.pendingNoteLong}</p>
@@ -1234,7 +1234,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
         </div>
         <div>
           <dt>{isPublic ? 'Provider' : 'Lane'}</dt>
-          <dd>{trackedLane ? `${trackedLane.provider} · ${trackedLane.model}` : '—'}</dd>
+          <dd>{trackedLane ? `${trackedLane.provider} · ${trackedLane.pastModel}` : '—'}</dd>
         </div>
         {!isPublic && (
           <div>

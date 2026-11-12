@@ -121,6 +121,8 @@ describe('v4 form, first render (config not loaded yet)', () => {
     const rendered = options(/<select[^>]*id="v4s-lane"[^>]*>[\s\S]*?<\/select>/.exec(renderForm('public'))?.[0] ?? '');
     assert.deepEqual(rendered.map((option) => option.value), ['', 'openai', 'google', 'xai']);
     assert.equal(rendered.some((option) => option.disabled), false);
+    // Without a config the static fallback names are offered.
+    assert.equal(rendered.find((option) => option.value === 'google')?.text, 'Google · gemini-4-carbon (about 20–25 min)');
   });
 
   it('operator: shows the three lane radios and not Anthropic', () => {
