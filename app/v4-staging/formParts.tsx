@@ -33,6 +33,14 @@ export interface SubmitGate {
   activeId: string | null;
 }
 
+/**
+ * The lane label for a submitted or earlier request (pending and status panels): the provider name only. Neither
+ * the stored record nor the backend's status says which model ran, so no model name is shown that could be wrong.
+ */
+export function requestProviderLabel(option: Pick<LaneOption, 'provider'> | undefined, fallback: string): string {
+  return option ? option.provider : fallback;
+}
+
 /** True when a fresh submission may be sent. The lane must still be offered and available for the case. */
 export function canSubmitForm(gate: SubmitGate): boolean {
   return (

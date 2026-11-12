@@ -36,20 +36,13 @@ describe('four-lane catalogue and validation', () => {
       value: 'anthropic',
       provider: 'Anthropic',
       model: 'claude-opus-5-5',
-      pastModel: 'claude-opus-5-5',
       capUsd: '12.00',
       typicalRuntime: '~25 min'
     });
   });
 
-  it('offers gemini-4-carbon as the Google fallback, while earlier requests keep origin/main labels', () => {
+  it('offers gemini-4-carbon as the Google fallback', () => {
     assert.equal(LANES.find((lane) => lane.value === 'google')?.model, 'gemini-4-carbon');
-    assert.deepEqual(Object.fromEntries(LANES.map((lane) => [lane.value, lane.pastModel])), {
-      openai: 'gpt-6-astra',
-      google: 'gemini-4-argon',
-      xai: 'grok-4.7',
-      anthropic: 'claude-opus-5-5'
-    });
   });
 
   it('accepts exactly the four lanes', () => {

@@ -52,12 +52,6 @@ export interface LaneOption {
   /** Model name offered for new requests when the backend config gives none (static fallback). */
   model: string;
   /**
-   * Model name shown for earlier requests (pending and status panels): origin/main's name for the lane. Neither
-   * the stored request record nor the backend's status says which model ran, so history is never relabelled
-   * with a newer fallback or with the current config.
-   */
-  pastModel: string;
-  /**
    * Per-request reservation cap in USD (two decimals, exactly as sent in
    * `ack_cap_usd`). Enforced on worst-case reservations before each call; it is
    * not a hard maximum on billed usage.
@@ -99,22 +93,15 @@ export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = 
 
 /**
  * Static lane table. The page offers a lane only when the backend config lists it (lib/v4Lanes.ts); `model` is
- * the fallback name for new requests when the config gives none (Google: gemini-4-carbon, the API model id
- * confirmed 2026-11-12), and `pastModel` labels earlier requests. `capUsd` is the operator page's expected
- * reservation cap.
+ * the fallback name offered for new requests when the config gives none (Google: gemini-4-carbon, the API model
+ * id confirmed 2026-11-12). Submitted and earlier requests show the provider name only. `capUsd` is the operator
+ * page's expected reservation cap.
  */
 export const LANES: readonly LaneOption[] = [
-  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', pastModel: 'gpt-6-astra', capUsd: '13.50', typicalRuntime: '~20 min' },
-  { value: 'google', provider: 'Google', model: 'gemini-4-carbon', pastModel: 'gemini-4-argon', capUsd: '13.50', typicalRuntime: '~20–25 min' },
-  { value: 'xai', provider: 'xAI', model: 'grok-4.7', pastModel: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' },
-  {
-    value: 'anthropic',
-    provider: 'Anthropic',
-    model: 'claude-opus-5-5',
-    pastModel: 'claude-opus-5-5',
-    capUsd: '12.00',
-    typicalRuntime: '~25 min'
-  }
+  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '13.50', typicalRuntime: '~20 min' },
+  { value: 'google', provider: 'Google', model: 'gemini-4-carbon', capUsd: '13.50', typicalRuntime: '~20–25 min' },
+  { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' },
+  { value: 'anthropic', provider: 'Anthropic', model: 'claude-opus-5-5', capUsd: '12.00', typicalRuntime: '~25 min' }
 ];
 
 /** Pilots with their descriptions, for the pages' props. */

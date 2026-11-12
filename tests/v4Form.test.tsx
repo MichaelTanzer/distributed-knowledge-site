@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import V4StagingForm from '../app/v4-staging/V4StagingForm';
-import { LaneRadios, ProviderSelect, canSubmitForm, type SubmitGate } from '../app/v4-staging/formParts';
+import { LaneRadios, ProviderSelect, canSubmitForm, requestProviderLabel, type SubmitGate } from '../app/v4-staging/formParts';
 import { effectiveLane, laneChoices, sanitizeLaneViews, type ConfigLaneView, type LaneValue, type PilotValue } from '../lib/v4Lanes';
 import {
   LANES,
@@ -210,5 +210,24 @@ describe('v4 form with the config loaded: malformed or duplicated lane data', ()
   it('a model of another family is never shown: the static name is', () => {
     const lanes = [{ ...FOUR_LANES[0], generatorModel: 'claude-opus-5-5' }, ...FOUR_LANES.slice(1)];
     assert.equal(options(renderSelect(lanes, '', '')).find((option) => option.value === 'openai')?.text, 'OpenAI · gpt-6-astra (about 20 min)');
+  });
+});
+
+describe('submitted and earlier requests (pending and status panels)', () => {
+  it('are labelled with the provider name only, never a model name', () => {
+    assert.deepEqual(
+      LANES.map((lane) => requestProviderLabel(lane, lane.value)),
+      ['OpenAI', 'Google', 'xAI', 'Anthropic']
+    );
+    for (const lane of LANES) {
+      const label = requestProviderLabel(lane, lane.value);
+      assert.equal(label.includes(lane.model), false, lane.value);
+      assert.doesNotMatch(label, /gpt-|gemini-|grok-|claude-/);
+    }
+  });
+
+  it('fall back to the given text when the lane is unknown', () => {
+    assert.equal(requestProviderLabel(undefined, '—'), '—');
+    assert.equal(requestProviderLabel(undefined, 'meta'), 'meta');
   });
 });

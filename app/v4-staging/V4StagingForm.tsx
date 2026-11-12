@@ -13,7 +13,7 @@ import type {
   SubmitAcceptedView
 } from '../../lib/v4Staging';
 import { effectiveLane, laneChoices, sanitizeLaneViews, type ConfigLaneView } from '../../lib/v4Lanes';
-import { LaneRadios, ProviderSelect, canSubmitForm } from './formParts';
+import { LaneRadios, ProviderSelect, canSubmitForm, requestProviderLabel } from './formParts';
 
 /** Last tracked request id (resumes polling after a reload). */
 const STORAGE_KEY = 'dkV4Staging.lastRequestId';
@@ -1126,7 +1126,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
           >
             <h2 className="v4s-label">{copy.pendingTitle}</h2>
             <p className="v4s-message">
-              {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.pastModel}` : record.lane} · for{' '}
+              {pilotLabel(record.pilot)} · {requestProviderLabel(recordLane, record.lane)} · for{' '}
               {record.recipient} · first sent {new Date(record.createdAt).toLocaleString()}
             </p>
             <p className="v4s-muted">{copy.pendingNoteLong}</p>
@@ -1234,7 +1234,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
         </div>
         <div>
           <dt>{isPublic ? 'Provider' : 'Lane'}</dt>
-          <dd>{trackedLane ? `${trackedLane.provider} · ${trackedLane.pastModel}` : '—'}</dd>
+          <dd>{requestProviderLabel(trackedLane, '—')}</dd>
         </div>
         {!isPublic && (
           <div>
