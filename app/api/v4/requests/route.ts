@@ -21,6 +21,7 @@ import {
   stagingNotFound,
   v4Enabled
 } from '../../../../lib/v4Staging';
+import { isPairUnavailable } from '../../../../lib/v4Lanes';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -37,7 +38,8 @@ function refuse(status: number, code: string, message: string) {
 /**
  * POST /api/v4/requests → backend POST /v1/requests.
  * Browser body: exactly {pilot, lane, recipient}; recipient is the requester's email, validated strictly
- * here (400 invalid_recipient before any backend call). ack_cap_usd is supplied from the backend config.
+ * here (400 invalid_recipient before any backend call). ack_cap_usd is supplied from the backend config, which
+ * also decides whether the lane is offered and whether this lane/case pair is available.
  */
 export async function POST(request: NextRequest) {
   if (!v4Enabled()) return stagingNotFound();
@@ -76,12 +78,23 @@ export async function POST(request: NextRequest) {
 
   const config = await backendRequest(BACKEND_PATHS.config, { method: 'GET', clientIp });
   if (config.kind !== 'ok') return errorResponse(publicError(mapBackendFailure(config, 'config')));
-  let ackCapUsd: string | null = null;
+  let view: ReturnType<typeof normalizeConfig> | null = null;
   try {
-    ackCapUsd = normalizeConfig(config.json).laneCapsUsd[parsed.body.lane] ?? null;
+    view = normalizeConfig(config.json);
   } catch {
-    ackCapUsd = null;
+    view = null;
   }
+  // Only what the backend offers: a lane it does not list, or a lane/case pair it marks unavailable, is refused
+  // here (a definitive 400) without calling POST /v1/requests. The backend refuses the pair too.
+  if (view && view.lanes !== null) {
+    if (!view.lanes.some((entry) => entry.lane === parsed.body.lane)) {
+      return refuse(400, 'lane_unavailable', 'The backend does not offer this lane.');
+    }
+    if (isPairUnavailable(view.lanes, parsed.body.lane, parsed.body.pilot)) {
+      return refuse(400, 'lane_pilot_unavailable', 'This lane is not available for this pilot.');
+    }
+  }
+  const ackCapUsd = view?.laneCapsUsd[parsed.body.lane] ?? null;
   if (!ackCapUsd) {
     return refuse(503, 'v4_unavailable', 'The staging backend did not report a reservation cap for this lane.');
   }

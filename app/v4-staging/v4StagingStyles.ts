@@ -98,6 +98,7 @@ export const V4_STAGING_CSS = `
   cursor: pointer;
 }
 .v4s-lane:has(input:checked) { border-color: rgba(208, 173, 86, 0.7); }
+.v4s-lane[data-unavailable] { opacity: .6; cursor: not-allowed; }
 .v4s-lane input { margin: 3px 0 0; accent-color: var(--gold); }
 .v4s-lane-body { display: grid; gap: 3px; }
 .v4s-lane-title { font-size: 15px; }
@@ -132,6 +133,10 @@ export const V4_STAGING_CSS = `
 .v4s-footnote { font-size: 11px; }
 .v4s-notice { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink); }
 .v4s-recipient-hint { margin: 0; }
+.v4s-kiq { display: grid; gap: 8px; }
+.v4s-case { display: grid; gap: 4px; }
+.v4s-case-title { margin: 0; font-size: 13px; line-height: 1.4; color: var(--ink); }
+.v4s-case-summary { margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); letter-spacing: 0.02em; }
 .v4s-form input:disabled,
 .v4s-form select:disabled { opacity: .6; }
 .v4s-actions { display: flex; gap: 10px; flex-wrap: wrap; }

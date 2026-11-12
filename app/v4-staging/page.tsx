@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
-import { LANES, PILOTS, RECIPIENT_PATTERN, REQUEST_ID_PATTERN, stagingPageEnabled } from '../../lib/v4Staging';
+import { LANES, RECIPIENT_PATTERN, REQUEST_ID_PATTERN, pilotsWithDescriptions, stagingPageEnabled } from '../../lib/v4Staging';
 import V4StagingForm from './V4StagingForm';
 import { V4_STAGING_CSS } from './v4StagingStyles';
 
@@ -20,7 +20,7 @@ export default function V4StagingPage() {
       <style>{V4_STAGING_CSS}</style>
       <V4StagingForm
         lanes={LANES.map((lane) => ({ ...lane }))}
-        pilots={PILOTS.map((pilot) => ({ ...pilot }))}
+        pilots={pilotsWithDescriptions()}
         recipientPattern={RECIPIENT_PATTERN.source}
         requestIdPattern={REQUEST_ID_PATTERN.source}
         variant="operator"

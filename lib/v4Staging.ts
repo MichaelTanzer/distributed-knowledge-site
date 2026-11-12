@@ -10,8 +10,10 @@
 import { isIP } from 'node:net';
 import { NextResponse } from 'next/server';
 import { operatorPreview, v4Enabled } from './v4Env';
+import { LANE_VALUES as KNOWN_LANE_VALUES, type ConfigLaneView, type LaneValue, type PilotValue } from './v4Lanes';
 
 export { operatorPreview, v4Enabled };
+export type { ConfigLaneView, LaneValue, PilotValue };
 
 if (typeof window !== 'undefined') {
   throw new Error('lib/v4Staging is server-only');
@@ -21,12 +23,19 @@ if (typeof window !== 'undefined') {
 // Catalogue (display labels; the `value` fields are the exact backend values)
 // ---------------------------------------------------------------------------
 
-export type PilotValue = 'SL-002' | 'SL-028' | 'SL-035';
-export type LaneValue = 'openai' | 'google' | 'xai';
+/** A short public description of a case, shown under the KIQ drop-down. */
+export interface CaseDescription {
+  /** A few words. */
+  title: string;
+  /** One or two plain sentences, at most 35 words: what the analyst is asked to assess. */
+  summary: string;
+}
 
 export interface PilotOption {
   value: PilotValue;
   label: string;
+  /** Filled from CASE_DESCRIPTIONS by the pages. */
+  description?: CaseDescription;
 }
 
 export interface LaneOption {
@@ -48,14 +57,48 @@ export const PILOTS: readonly PilotOption[] = [
   { value: 'SL-035', label: 'KIQ example 3 (SL-035)' }
 ];
 
+/**
+ * Case descriptions shown under the KIQ drop-down (edit the text here). Written only from the PUBLIC fields of
+ * the frozen setups (`content.resolution.setup.public`: `topic`, `what_question`, `so_what_question`), which the
+ * expert packet shows the test-taker. Nothing from hidden fields: no candidate explanations, answers,
+ * mechanisms, culprits, sponsors or scoring. The names are the scenarios' fictional names.
+ */
+export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = {
+  'SL-002': {
+    title: 'Border mobilization near Vesmar',
+    summary:
+      "Over 21 days, assess what Kandara's force movements near Vesmar indicate and whose decisions explain them. Then weigh what each reading means for Arven: its commitment to Lydon and the safety of its forces."
+  },
+  'SL-028': {
+    title: 'Critical-infrastructure disruption',
+    summary:
+      "Within 21 days, assess what caused the repeated interruptions of Pellam and, if any interference occurred, who carried it out and whether a foreign state was involved. Then weigh the Principals' options under each explanation."
+  },
+  'SL-035': {
+    title: 'Security-service reshuffle in Iskar',
+    summary:
+      'Within 45 days, assess what the Iskar security-service reshuffle reflects and whose decisions explain it. Then weigh what each reading means for the crisis-contact channel to Kandara and for relying on Iskar counterparts.'
+  }
+};
+
+/**
+ * Static lane table. The page offers a lane only when the backend config lists it (lib/v4Lanes.ts); `model` is
+ * the fallback name when the config gives none. `capUsd` is the operator page's expected reservation cap.
+ */
 export const LANES: readonly LaneOption[] = [
   { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '13.50', typicalRuntime: '~20 min' },
   { value: 'google', provider: 'Google', model: 'gemini-4-argon', capUsd: '13.50', typicalRuntime: '~20–25 min' },
-  { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' }
+  { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' },
+  { value: 'anthropic', provider: 'Anthropic', model: 'claude-opus-5-5', capUsd: '12.00', typicalRuntime: '~25 min' }
 ];
 
+/** Pilots with their descriptions, for the pages' props. */
+export function pilotsWithDescriptions(): PilotOption[] {
+  return PILOTS.map((pilot) => ({ ...pilot, description: { ...CASE_DESCRIPTIONS[pilot.value] } }));
+}
+
 const PILOT_VALUES: ReadonlySet<string> = new Set(PILOTS.map((pilot) => pilot.value));
-const LANE_VALUES: ReadonlySet<string> = new Set(LANES.map((lane) => lane.value));
+const LANE_VALUES: ReadonlySet<string> = new Set(KNOWN_LANE_VALUES);
 
 export function isPilot(value: unknown): value is PilotValue {
   return typeof value === 'string' && PILOT_VALUES.has(value);
@@ -102,6 +145,8 @@ export const BACKEND_FIELDS = {
     lanes: 'lanes',
     laneId: 'lane',
     laneCapUsd: 'capUsd',
+    laneGeneratorModel: 'generatorModel',
+    laneUnavailablePilots: 'unavailablePilots',
     backendSha: 's1'
   },
   /**
@@ -217,6 +262,11 @@ export interface StagingConfigView {
   runInProgress: boolean | null;
   reconciliationRequired: boolean | null;
   laneCapsUsd: Partial<Record<LaneValue, string>>;
+  /**
+   * The lanes the backend lists (lane, generator model, unavailable cases), in both audiences: no money. null
+   * when the backend config has no usable `lanes` field (the form then offers the fallback three).
+   */
+  lanes: ConfigLaneView[] | null;
   backendSha: string | null;
 }
 
@@ -344,6 +394,47 @@ function laneCapsFrom(value: unknown): Partial<Record<LaneValue, string>> {
   return caps;
 }
 
+/** A plain model id (letters, digits, `.`, `_`, `:`, `-`; at most 64 characters), else null. */
+function modelId(value: unknown): string | null {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value) ? value : null;
+}
+
+/** Known case ids from `unavailablePilots`, deduplicated; anything that is not an array counts as none. */
+function unavailablePilotsFrom(value: unknown): PilotValue[] {
+  if (!Array.isArray(value)) return [];
+  const pilots: PilotValue[] = [];
+  for (const item of value) if (isPilot(item) && !pilots.includes(item)) pilots.push(item);
+  return pilots;
+}
+
+/**
+ * The backend's `lanes` (an array of {lane, generatorModel, unavailablePilots, ...}; an object keyed by lane is
+ * also read, like laneCapsFrom). Only lanes the site knows are kept, the first entry per lane wins, and only
+ * the lane, model and unavailable cases are kept. null when the field is missing or not an array or object.
+ */
+function configLanesFrom(value: unknown): ConfigLaneView[] | null {
+  const f = BACKEND_FIELDS.config;
+  const entries: Array<[unknown, unknown]> = [];
+  if (Array.isArray(value)) {
+    for (const entry of value) if (isObject(entry)) entries.push([pick(entry, f.laneId), entry]);
+  } else if (isObject(value)) {
+    for (const [lane, entry] of Object.entries(value)) entries.push([lane, entry]);
+  } else {
+    return null;
+  }
+  const lanes: ConfigLaneView[] = [];
+  for (const [lane, entry] of entries) {
+    if (!isLane(lane) || lanes.some((item) => item.lane === lane)) continue;
+    const source = isObject(entry) ? entry : {};
+    lanes.push({
+      lane,
+      model: modelId(pick(source, f.laneGeneratorModel)),
+      unavailablePilots: unavailablePilotsFrom(pick(source, f.laneUnavailablePilots))
+    });
+  }
+  return lanes;
+}
+
 export function normalizeConfig(raw: unknown): StagingConfigView {
   const source = isObject(raw) ? raw : {};
   const f = BACKEND_FIELDS.config;
@@ -365,6 +456,7 @@ export function normalizeConfig(raw: unknown): StagingConfigView {
     runInProgress: bool(pick(source, f.runInProgress)),
     reconciliationRequired: bool(pick(source, f.reconciliationRequired)),
     laneCapsUsd: laneCapsFrom(pick(source, f.lanes)),
+    lanes: configLanesFrom(pick(source, f.lanes)),
     backendSha: typeof sha === 'string' && /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12) : null
   };
 }
@@ -421,7 +513,8 @@ export const KNOWN_ERROR_STATUS = {
   recipient_not_allowed: 403,
   invalid_recipient: 400,
   origin_not_allowed: 403,
-  bad_client_ip: 400
+  bad_client_ip: 400,
+  lane_pilot_unavailable: 400
 } as const;
 
 export type KnownErrorCode = keyof typeof KNOWN_ERROR_STATUS;
@@ -439,7 +532,8 @@ const KNOWN_ERROR_FALLBACK: Record<KnownErrorCode, string> = {
   recipient_not_allowed: 'The recipient is not on the staging allowlist.',
   invalid_recipient: 'Enter a single valid email address.',
   origin_not_allowed: 'This origin is not allowed.',
-  bad_client_ip: 'The client address could not be determined.'
+  bad_client_ip: 'The client address could not be determined.',
+  lane_pilot_unavailable: 'This lane is not available for this pilot (backend unavailable pair).'
 };
 
 /**
@@ -458,6 +552,8 @@ export const PUBLIC_ERROR_COPY: Readonly<Record<string, string>> = {
   duplicate: 'This request was already received.',
   origin_not_allowed: 'Please send the request from the Distributed Knowledge website.',
   bad_client_ip: 'Your connection could not be identified. Please try again later.',
+  lane_pilot_unavailable: 'This provider is not available for this case. Please choose another provider.',
+  lane_unavailable: 'This provider is not available right now. Please choose another provider.',
   invalid_request: 'Please check the form and try again.',
   body_too_large: 'Please check the form and try again.',
   unsupported_media_type: 'Please check the form and try again.',
@@ -483,7 +579,10 @@ export function publicError(mapped: MappedError): MappedError {
   return { status: mapped.status, body };
 }
 
-/** Public deployments omit every money and build figure from the config view (same shape, nulled). */
+/**
+ * Public deployments omit every money and build figure from the config view (same shape, nulled). `lanes`
+ * (lane, generator model, unavailable cases) carries no money and stays: the public form needs it.
+ */
 export function configForAudience(view: StagingConfigView): StagingConfigView {
   if (operatorPreview()) return view;
   return {

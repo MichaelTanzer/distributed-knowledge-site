@@ -1,5 +1,5 @@
 import { notFound } from 'next/navigation';
-import { LANES, PILOTS, PUBLIC_ERROR_COPY, RECIPIENT_PATTERN, REQUEST_ID_PATTERN, v4Enabled } from '../../lib/v4Staging';
+import { LANES, PUBLIC_ERROR_COPY, RECIPIENT_PATTERN, REQUEST_ID_PATTERN, pilotsWithDescriptions, v4Enabled } from '../../lib/v4Staging';
 import V4StagingForm from '../v4-staging/V4StagingForm';
 import { V4_STAGING_CSS } from '../v4-staging/v4StagingStyles';
 
@@ -19,7 +19,7 @@ export default function GenerateV4Page() {
         errorCopy={{ ...PUBLIC_ERROR_COPY }}
         // No budget figures in the public page payload: the public form never uses a lane's cap.
         lanes={LANES.map((lane) => ({ ...lane, capUsd: '' }))}
-        pilots={PILOTS.map((pilot) => ({ ...pilot }))}
+        pilots={pilotsWithDescriptions()}
         recipientPattern={RECIPIENT_PATTERN.source}
         requestIdPattern={REQUEST_ID_PATTERN.source}
         variant="public"
