@@ -12,6 +12,8 @@ import type {
   StagingConfigView,
   SubmitAcceptedView
 } from '../../lib/v4Staging';
+import { effectiveLane, laneChoices, sanitizeLaneViews, type ConfigLaneView } from '../../lib/v4Lanes';
+import { LaneRadios, ProviderSelect, canSubmitForm, requestProviderLabel } from './formParts';
 
 /** Last tracked request id (resumes polling after a reload). */
 const STORAGE_KEY = 'dkV4Staging.lastRequestId';
@@ -181,6 +183,10 @@ interface Props {
   /** `operator`: the Preview-only /v4-staging page. `public`: the v4 form on /generate. */
   variant: Variant;
   pilots: PilotOption[];
+  /**
+   * Every lane the site knows: recovery records and statuses are read against all of them. The provider choice
+   * shows only the lanes the backend config lists (the fallback three while the config is unavailable).
+   */
   lanes: LaneOption[];
   requestIdPattern: string;
   /** Same strict single-address pattern the API enforces. */
@@ -566,6 +572,14 @@ function isConfigView(payload: unknown): payload is StagingConfigView {
   return isRecord(payload) && typeof payload.spendState === 'string' && isRecord(payload.laneCapsUsd);
 }
 
+/**
+ * The lanes the backend offers, validated again in the browser with the server's rules (lib/v4Lanes.ts). null
+ * while the config is loading or unavailable, or when it has no per-lane data: the legacy three are offered.
+ */
+function configLanesOf(config: StagingConfigView | null): ConfigLaneView[] | null {
+  return config === null ? null : sanitizeLaneViews(config.lanes);
+}
+
 function isAcceptedView(payload: unknown, pattern: RegExp): payload is SubmitAcceptedView {
   return isRecord(payload) && typeof payload.requestId === 'string' && pattern.test(payload.requestId);
 }
@@ -844,7 +858,23 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
   }, [finishedId, loadConfig]);
 
   const config = configState.status === 'ready' ? configState.config : null;
-  const selectedLane = laneOption(lane);
+  /** Lanes the backend offers; null while loading or when the config is unavailable (legacy three offered). */
+  const configLanes = useMemo(() => configLanesOf(config), [config]);
+  /** Offered providers only; a provider the backend marks unavailable for the selected case is disabled. */
+  const choices = laneChoices(lanes, configLanes, pilot);
+  /** The selected lane while it is selectable, else '': this is what the controls show and a submission uses. */
+  const shownLane = effectiveLane(lane, pilot, configLanes);
+
+  // A selected provider that is no longer offered, or is unavailable for the selected case, is cleared (and stays
+  // cleared if the case changes back).
+  useEffect(() => {
+    if (lane !== '' && shownLane === '') {
+      setLane('');
+      setAcknowledged(false);
+    }
+  }, [lane, shownLane]);
+
+  const selectedLane = laneOption(shownLane);
   const backendCap = selectedLane && config ? config.laneCapsUsd[selectedLane.value] ?? null : null;
   const effectiveCap = selectedLane ? backendCap ?? selectedLane.capUsd : null;
   const paused = config?.spendState === 'admission_disabled';
@@ -860,20 +890,24 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
   const trimmedRecipient = recipient.trim();
   const recipientValid = catalog.recipientRe.test(trimmedRecipient);
 
-  const canSubmit =
-    config !== null &&
-    !paused &&
-    !reconciliation &&
-    !backendBusy &&
-    pilot !== '' &&
-    selectedLane !== undefined &&
-    recipientValid &&
-    (isPublic || (effectiveCap !== null && acknowledged)) &&
-    !submitting &&
-    storageOk === true &&
-    locksOk === true &&
-    !blockingRecords &&
-    activeId === null;
+  const canSubmit = canSubmitForm({
+    configReady: config !== null,
+    paused,
+    reconciliation,
+    backendBusy,
+    pilot,
+    lane: selectedLane?.value ?? '',
+    configLanes,
+    recipientValid,
+    publicVariant: isPublic,
+    effectiveCap,
+    acknowledged,
+    submitting,
+    storageOk,
+    locksOk,
+    blockingRecords,
+    activeId
+  });
 
   function showError(code: string, message: string) {
     setSubmitState({ status: 'error', error: { code, message } });
@@ -974,6 +1008,8 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
     const error = shownError(
       asApiError(payload, `The request failed (HTTP ${response.status}). The outcome is unknown; retry the same submission.`)
     );
+    // The backend no longer offers this lane or this lane/case pair: reload its list so the choice updates.
+    if (error.code === 'lane_pilot_unavailable' || error.code === 'lane_unavailable') void loadConfig();
     const outcomeUnknown = response.status >= 500 || error.code === 'unexpected_response' || response.ok;
     if (outcomeUnknown) {
       // 5xx, unreadable or unexpected answer: this dispatch's outcome is unknown too.
@@ -1007,9 +1043,9 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (inFlightRef.current !== null) return;
-    // canSubmit already implies a selected pilot (TypeScript narrows `pilot` through it). The authoritative
-    // "nothing unresolved exists" check runs again inside the records lock (beginFreshLocked).
-    if (!canSubmit || !selectedLane) return;
+    // canSubmit already implies a selected pilot and a selectable lane (`pilot === ''` is repeated for TypeScript).
+    // The authoritative "nothing unresolved exists" check runs again inside the records lock (beginFreshLocked).
+    if (!canSubmit || !selectedLane || pilot === '') return;
     if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
       showError('no_uuid', 'This browser cannot generate a request key.');
       return;
@@ -1090,7 +1126,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
           >
             <h2 className="v4s-label">{copy.pendingTitle}</h2>
             <p className="v4s-message">
-              {pilotLabel(record.pilot)} · {recordLane ? `${recordLane.provider} · ${recordLane.model}` : record.lane} · for{' '}
+              {pilotLabel(record.pilot)} · {requestProviderLabel(recordLane, record.lane)} · for{' '}
               {record.recipient} · first sent {new Date(record.createdAt).toLocaleString()}
             </p>
             <p className="v4s-muted">{copy.pendingNoteLong}</p>
@@ -1138,28 +1174,41 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
     </label>
   );
 
+  const pilotDescription = pilots.find((option) => option.value === pilot)?.description;
   const pilotField = (
-    <label className="v4s-field" htmlFor="v4s-pilot">
-      <span className="v4s-label">{isPublic ? 'KIQ' : 'Pilot'}</span>
-      <select
-        disabled={locked}
-        id="v4s-pilot"
-        onChange={(event) => {
-          if (locked || inFlightRef.current !== null) return;
-          setPilot(event.target.value as PilotValue | '');
-          setSubmitState({ status: 'idle' });
-        }}
-        required
-        value={pilot}
-      >
-        <option value="">{isPublic ? 'Select a KIQ' : 'Select a pilot'}</option>
-        {pilots.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
+    <div className="v4s-kiq">
+      <label className="v4s-field" htmlFor="v4s-pilot">
+        <span className="v4s-label">{isPublic ? 'KIQ' : 'Pilot'}</span>
+        <select
+          aria-describedby="v4s-pilot-description"
+          disabled={locked}
+          id="v4s-pilot"
+          onChange={(event) => {
+            if (locked || inFlightRef.current !== null) return;
+            setPilot(event.target.value as PilotValue | '');
+            setSubmitState({ status: 'idle' });
+          }}
+          required
+          value={pilot}
+        >
+          <option value="">{isPublic ? 'Select a KIQ' : 'Select a pilot'}</option>
+          {pilots.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {/* Outside the label so it describes the select instead of becoming part of its name. */}
+      <div aria-live="polite" className="v4s-case" data-pilot={pilotDescription ? pilot : ''} id="v4s-pilot-description">
+        {pilotDescription && (
+          <>
+            <p className="v4s-case-title">{pilotDescription.title}</p>
+            <p className="v4s-case-summary">{pilotDescription.summary}</p>
+          </>
+        )}
+      </div>
+    </div>
   );
 
   const statusPanel = tracked && (
@@ -1185,7 +1234,7 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
         </div>
         <div>
           <dt>{isPublic ? 'Provider' : 'Lane'}</dt>
-          <dd>{trackedLane ? `${trackedLane.provider} · ${trackedLane.model}` : '—'}</dd>
+          <dd>{requestProviderLabel(trackedLane, '—')}</dd>
         </div>
         {!isPublic && (
           <div>
@@ -1328,27 +1377,16 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
           <form className="v4s-form" data-config={configState.status} onSubmit={submit}>
             {recipientField}
             {pilotField}
-            <label className="v4s-field" htmlFor="v4s-lane">
-              <span className="v4s-label">Provider</span>
-              <select
-                disabled={locked}
-                id="v4s-lane"
-                onChange={(event) => {
-                  if (locked || inFlightRef.current !== null) return;
-                  setLane(event.target.value as LaneValue | '');
-                  setSubmitState({ status: 'idle' });
-                }}
-                required
-                value={lane}
-              >
-                <option value="">Select a provider</option>
-                {lanes.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.provider} · {option.model} (about {option.typicalRuntime.replace(/^~/, '')})
-                  </option>
-                ))}
-              </select>
-            </label>
+            <ProviderSelect
+              choices={choices}
+              disabled={locked}
+              onSelect={(value) => {
+                if (locked || inFlightRef.current !== null) return;
+                setLane(value);
+                setSubmitState({ status: 'idle' });
+              }}
+              value={shownLane}
+            />
             <button className="v4s-submit" disabled={!canSubmit} type="submit">
               {submitting ? 'Sending…' : 'Generate'}
             </button>
@@ -1414,42 +1452,18 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
         <form className="v4s-form" data-config={configState.status} onSubmit={submit}>
           {pilotField}
 
-          <fieldset className="v4s-lanes">
-            <legend className="v4s-label">Lane</legend>
-            {lanes.map((option) => {
-              const cap = config?.laneCapsUsd[option.value] ?? option.capUsd;
-              return (
-                <label className="v4s-lane" key={option.value}>
-                  <input
-                    checked={lane === option.value}
-                    disabled={locked}
-                    name="lane"
-                    onChange={() => {
-                      if (locked || inFlightRef.current !== null) return;
-                      setLane(option.value);
-                      setAcknowledged(false);
-                      setSubmitState({ status: 'idle' });
-                    }}
-                    required
-                    type="radio"
-                    value={option.value}
-                  />
-                  <span className="v4s-lane-body">
-                    <span className="v4s-lane-title">
-                      {option.provider} · {option.model}
-                    </span>
-                    <span className="v4s-lane-meta">
-                      Reservation cap ${cap} per run (worst case per call, reserved before calls are made) · typical runtime{' '}
-                      {option.typicalRuntime}
-                    </span>
-                    {cap !== option.capUsd && (
-                      <span className="v4s-lane-meta v4s-warn">Backend reservation cap differs from the expected ${option.capUsd}.</span>
-                    )}
-                  </span>
-                </label>
-              );
-            })}
-          </fieldset>
+          <LaneRadios
+            caps={config?.laneCapsUsd ?? {}}
+            choices={choices}
+            disabled={locked}
+            onSelect={(value) => {
+              if (locked || inFlightRef.current !== null) return;
+              setLane(value);
+              setAcknowledged(false);
+              setSubmitState({ status: 'idle' });
+            }}
+            value={shownLane}
+          />
 
           {recipientField}
 

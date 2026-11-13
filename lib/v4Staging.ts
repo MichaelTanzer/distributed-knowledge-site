@@ -10,8 +10,18 @@
 import { isIP } from 'node:net';
 import { NextResponse } from 'next/server';
 import { operatorPreview, v4Enabled } from './v4Env';
+import {
+  LANE_VALUES as KNOWN_LANE_VALUES,
+  LEGACY_LANE_VALUES,
+  isLegacyLane,
+  plausibleModel,
+  type ConfigLaneView,
+  type LaneValue,
+  type PilotValue
+} from './v4Lanes';
 
 export { operatorPreview, v4Enabled };
+export type { ConfigLaneView, LaneValue, PilotValue };
 
 if (typeof window !== 'undefined') {
   throw new Error('lib/v4Staging is server-only');
@@ -21,17 +31,25 @@ if (typeof window !== 'undefined') {
 // Catalogue (display labels; the `value` fields are the exact backend values)
 // ---------------------------------------------------------------------------
 
-export type PilotValue = 'SL-002' | 'SL-028' | 'SL-035';
-export type LaneValue = 'openai' | 'google' | 'xai';
+/** A short public description of a case, shown under the KIQ drop-down. */
+export interface CaseDescription {
+  /** A few words. */
+  title: string;
+  /** One or two plain sentences, at most 35 words: what the analyst is asked to assess. */
+  summary: string;
+}
 
 export interface PilotOption {
   value: PilotValue;
   label: string;
+  /** Filled from CASE_DESCRIPTIONS by the pages. */
+  description?: CaseDescription;
 }
 
 export interface LaneOption {
   value: LaneValue;
   provider: string;
+  /** Model name offered for new requests when the backend config gives none (static fallback). */
   model: string;
   /**
    * Per-request reservation cap in USD (two decimals, exactly as sent in
@@ -48,14 +66,51 @@ export const PILOTS: readonly PilotOption[] = [
   { value: 'SL-035', label: 'KIQ example 3 (SL-035)' }
 ];
 
+/**
+ * Case descriptions shown under the KIQ drop-down (edit the text here; MT approved this text on 2026-11-12). Written
+ * only from the PUBLIC fields of the frozen setups (`content.resolution.setup.public`: `topic`, `what_question`,
+ * `so_what_question`, and for SL-028 the public background claim that Pellam suffered repeated regional power
+ * interruptions), which the expert packet shows the test-taker. Nothing from hidden fields: no candidate explanations, answers,
+ * mechanisms, culprits, sponsors or scoring. The names are the scenarios' fictional names.
+ */
+export const CASE_DESCRIPTIONS: Readonly<Record<PilotValue, CaseDescription>> = {
+  'SL-002': {
+    title: 'Border mobilization near Vesmar',
+    summary:
+      "Over 21 days, assess what Kandara's force movements near Vesmar indicate and whose decisions explain them. Then weigh what each reading means for Arven: its commitment to Lydon and the safety of its forces."
+  },
+  'SL-028': {
+    title: 'Critical-infrastructure disruption',
+    summary:
+      "Within 21 days, assess what caused the repeated power interruptions in Pellam and, if any interference occurred, who carried it out and whether a foreign state was involved. Then weigh the Principals' options under each explanation."
+  },
+  'SL-035': {
+    title: 'Security-service reshuffle in Iskar',
+    summary:
+      'Within 45 days, assess what the Iskar security-service reshuffle reflects and whose decisions explain it. Then weigh what each reading means for the crisis-contact channel to Kandara and for relying on Iskar counterparts.'
+  }
+};
+
+/**
+ * Static lane table. The page offers a lane only when the backend config lists it (lib/v4Lanes.ts); `model` is
+ * the fallback name offered for new requests when the config gives none (Google: gemini-4-carbon, the API model
+ * id confirmed 2026-11-12). Submitted and earlier requests show the provider name only. `capUsd` is the operator
+ * page's expected reservation cap.
+ */
 export const LANES: readonly LaneOption[] = [
-  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '13.50', typicalRuntime: '~20 min' },
-  { value: 'google', provider: 'Google', model: 'gemini-4-argon', capUsd: '13.50', typicalRuntime: '~20–25 min' },
-  { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' }
+  { value: 'openai', provider: 'OpenAI', model: 'gpt-6-astra', capUsd: '15.00', typicalRuntime: '~20 min' },
+  { value: 'google', provider: 'Google', model: 'gemini-4-carbon', capUsd: '15.00', typicalRuntime: '~20–25 min' },
+  { value: 'xai', provider: 'xAI', model: 'grok-4.7', capUsd: '8.75', typicalRuntime: '~70 min' },
+  { value: 'anthropic', provider: 'Anthropic', model: 'claude-opus-5-5', capUsd: '12.00', typicalRuntime: '~25 min' }
 ];
 
+/** Pilots with their descriptions, for the pages' props. */
+export function pilotsWithDescriptions(): PilotOption[] {
+  return PILOTS.map((pilot) => ({ ...pilot, description: { ...CASE_DESCRIPTIONS[pilot.value] } }));
+}
+
 const PILOT_VALUES: ReadonlySet<string> = new Set(PILOTS.map((pilot) => pilot.value));
-const LANE_VALUES: ReadonlySet<string> = new Set(LANES.map((lane) => lane.value));
+const LANE_VALUES: ReadonlySet<string> = new Set(KNOWN_LANE_VALUES);
 
 export function isPilot(value: unknown): value is PilotValue {
   return typeof value === 'string' && PILOT_VALUES.has(value);
@@ -102,6 +157,8 @@ export const BACKEND_FIELDS = {
     lanes: 'lanes',
     laneId: 'lane',
     laneCapUsd: 'capUsd',
+    laneGeneratorModel: 'generatorModel',
+    laneUnavailablePilots: 'unavailablePilots',
     backendSha: 's1'
   },
   /**
@@ -217,6 +274,11 @@ export interface StagingConfigView {
   runInProgress: boolean | null;
   reconciliationRequired: boolean | null;
   laneCapsUsd: Partial<Record<LaneValue, string>>;
+  /**
+   * The lanes the backend lists (lane, generator model, unavailable cases), in both audiences: no money. null
+   * when the backend config has no usable `lanes` field (the form then offers the fallback three).
+   */
+  lanes: ConfigLaneView[] | null;
   backendSha: string | null;
 }
 
@@ -324,24 +386,77 @@ function spendStateFrom(source: JsonObject): SpendState {
   return 'unknown';
 }
 
-function laneCapsFrom(value: unknown): Partial<Record<LaneValue, string>> {
+/** A cap exactly as the backend writes it and as `ack_cap_usd` is sent: a two-decimal string such as "15.00". */
+const CAP_PATTERN = /^\d{1,4}\.\d{2}$/;
+
+function capString(value: unknown): string | null {
+  return typeof value === 'string' && CAP_PATTERN.test(value) ? value : null;
+}
+
+/** The known case ids of a well-formed `unavailablePilots` (an array of known case ids only), else null. */
+function unavailablePilotsFrom(value: unknown): PilotValue[] | null {
+  if (!Array.isArray(value) || !value.every(isPilot)) return null;
+  return [...new Set(value)];
+}
+
+interface LaneAnalysis {
+  /** Offered lanes; null when the backend gives no per-lane data (the legacy three are then offered). */
+  lanes: ConfigLaneView[] | null;
+  /** Caps the route may acknowledge, each from the same entry that made its lane offered. */
+  caps: Partial<Record<LaneValue, string>>;
+}
+
+/**
+ * Reads the backend's `lanes`, failing closed. Only the declared array form can offer a lane:
+ * - a lane listed exactly once is offered only if its entry is well formed: a cap string (`capUsd`, e.g.
+ *   "12.00") and `unavailablePilots` that is an array of known case ids. `unavailablePilots` may be absent only
+ *   for the legacy lanes (today's three-lane backend sends none); a non-legacy lane also needs a generator
+ *   model of its own family. Its model, restrictions and cap all come from that one entry. A malformed entry
+ *   offers nothing and supplies no cap;
+ * - a legacy lane listed more than once keeps origin/main's behaviour: it is offered without site-side
+ *   restrictions (the backend still enforces its own), shows the static model name, and its cap is the last
+ *   valid cap among its entries, exactly as origin/main's laneCapsFrom chose it. Any other lane listed more than
+ *   once is not offered;
+ * - unknown lanes and non-object entries are ignored.
+ * An object keyed by lane (origin/main also read it) offers nothing new: `lanes` is null, so only the legacy
+ * three are offered, with their caps read as origin/main read them; no other lane gets a cap. A missing or
+ * scalar `lanes` gives null and no caps.
+ */
+function lanesFrom(value: unknown): LaneAnalysis {
   const f = BACKEND_FIELDS.config;
   const caps: Partial<Record<LaneValue, string>> = {};
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      if (!isObject(entry)) continue;
-      const lane = pick(entry, f.laneId);
-      const cap = usd(pick(entry, f.laneCapUsd));
-      if (isLane(lane) && cap) caps[lane] = cap;
-    }
-  } else if (isObject(value)) {
-    for (const lane of LANE_VALUES) {
+  if (isObject(value)) {
+    for (const lane of LEGACY_LANE_VALUES) {
       const entry = value[lane];
       const cap = isObject(entry) ? usd(pick(entry, f.laneCapUsd)) : usd(entry);
-      if (cap) caps[lane as LaneValue] = cap;
+      if (cap) caps[lane] = cap;
     }
+    return { lanes: null, caps };
   }
-  return caps;
+  if (!Array.isArray(value)) return { lanes: null, caps };
+  const lanes: ConfigLaneView[] = [];
+  for (const lane of KNOWN_LANE_VALUES) {
+    const entries = value.filter((entry): entry is JsonObject => isObject(entry) && pick(entry, f.laneId) === lane);
+    if (entries.length === 0) continue;
+    if (entries.length > 1) {
+      if (!isLegacyLane(lane)) continue;
+      lanes.push({ lane, model: null, unavailablePilots: [] });
+      for (const entry of entries) {
+        const cap = usd(pick(entry, f.laneCapUsd));
+        if (cap) caps[lane] = cap;
+      }
+      continue;
+    }
+    const entry = entries[0] as JsonObject;
+    const cap = capString(pick(entry, f.laneCapUsd));
+    const rawPilots = pick(entry, f.laneUnavailablePilots);
+    const unavailable = rawPilots === undefined && isLegacyLane(lane) ? [] : unavailablePilotsFrom(rawPilots);
+    const model = plausibleModel(lane, pick(entry, f.laneGeneratorModel));
+    if (!cap || !unavailable || (!isLegacyLane(lane) && model === null)) continue;
+    lanes.push({ lane, model, unavailablePilots: unavailable });
+    caps[lane] = cap;
+  }
+  return { lanes, caps };
 }
 
 export function normalizeConfig(raw: unknown): StagingConfigView {
@@ -354,6 +469,7 @@ export function normalizeConfig(raw: unknown): StagingConfigView {
   }
   const sha = pick(source, f.backendSha);
   const day = pick(source, f.dayUtc);
+  const lanes = lanesFrom(pick(source, f.lanes));
   return {
     recipient,
     dailyRemainingUsd: usd(pick(source, f.dailyRemainingUsd)),
@@ -364,7 +480,8 @@ export function normalizeConfig(raw: unknown): StagingConfigView {
     spendState: spendStateFrom(source),
     runInProgress: bool(pick(source, f.runInProgress)),
     reconciliationRequired: bool(pick(source, f.reconciliationRequired)),
-    laneCapsUsd: laneCapsFrom(pick(source, f.lanes)),
+    laneCapsUsd: lanes.caps,
+    lanes: lanes.lanes,
     backendSha: typeof sha === 'string' && /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12) : null
   };
 }
@@ -421,7 +538,8 @@ export const KNOWN_ERROR_STATUS = {
   recipient_not_allowed: 403,
   invalid_recipient: 400,
   origin_not_allowed: 403,
-  bad_client_ip: 400
+  bad_client_ip: 400,
+  lane_pilot_unavailable: 400
 } as const;
 
 export type KnownErrorCode = keyof typeof KNOWN_ERROR_STATUS;
@@ -439,7 +557,8 @@ const KNOWN_ERROR_FALLBACK: Record<KnownErrorCode, string> = {
   recipient_not_allowed: 'The recipient is not on the staging allowlist.',
   invalid_recipient: 'Enter a single valid email address.',
   origin_not_allowed: 'This origin is not allowed.',
-  bad_client_ip: 'The client address could not be determined.'
+  bad_client_ip: 'The client address could not be determined.',
+  lane_pilot_unavailable: 'This lane is not available for this pilot (backend unavailable pair).'
 };
 
 /**
@@ -458,6 +577,8 @@ export const PUBLIC_ERROR_COPY: Readonly<Record<string, string>> = {
   duplicate: 'This request was already received.',
   origin_not_allowed: 'Please send the request from the Distributed Knowledge website.',
   bad_client_ip: 'Your connection could not be identified. Please try again later.',
+  lane_pilot_unavailable: 'This provider is not available for this case. Please choose another provider.',
+  lane_unavailable: 'This provider is not available right now. Please choose another provider.',
   invalid_request: 'Please check the form and try again.',
   body_too_large: 'Please check the form and try again.',
   unsupported_media_type: 'Please check the form and try again.',
@@ -483,7 +604,10 @@ export function publicError(mapped: MappedError): MappedError {
   return { status: mapped.status, body };
 }
 
-/** Public deployments omit every money and build figure from the config view (same shape, nulled). */
+/**
+ * Public deployments omit every money and build figure from the config view (same shape, nulled). `lanes`
+ * (lane, generator model, unavailable cases) carries no money and stays: the public form needs it.
+ */
 export function configForAudience(view: StagingConfigView): StagingConfigView {
   if (operatorPreview()) return view;
   return {
