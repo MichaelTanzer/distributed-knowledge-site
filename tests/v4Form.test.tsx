@@ -146,6 +146,37 @@ describe('v4 form, first render (config not loaded yet)', () => {
     });
   }
 
+  it('public: names all three KIQ scenarios while preserving their submitted values', () => {
+    const kiq = /<select[^>]*id="v4s-pilot"[^>]*>[\s\S]*?<\/select>/.exec(renderForm('public'))?.[0] ?? '';
+    assert.deepEqual(options(kiq).map(({ value, text }) => ({ value, text })), [
+      { value: '', text: 'Select a KIQ' },
+      { value: 'SL-002', text: 'Border mobilization near Vesmar (SL-002)' },
+      { value: 'SL-028', text: 'Critical-infrastructure disruption (SL-028)' },
+      { value: 'SL-035', text: 'Security-service reshuffle in Iskar (SL-035)' }
+    ]);
+  });
+
+  it('operator: preserves the existing pilot labels', () => {
+    const kiq = /<select[^>]*id="v4s-pilot"[^>]*>[\s\S]*?<\/select>/.exec(renderForm('operator'))?.[0] ?? '';
+    assert.deepEqual(options(kiq).map((option) => option.text), [
+      'Select a pilot', 'KIQ example 1 (SL-002)', 'KIQ example 2 (SL-028)', 'KIQ example 3 (SL-035)'
+    ]);
+  });
+
+  it('public: falls back to the supplied label when a description is absent', () => {
+    const html = renderToStaticMarkup(
+      <V4StagingForm
+        lanes={PUBLIC_LANES}
+        pilots={[{ value: 'SL-002', label: 'Fallback case (SL-002)' }]}
+        recipientPattern={RECIPIENT_PATTERN.source}
+        requestIdPattern={REQUEST_ID_PATTERN.source}
+        variant="public"
+      />
+    );
+    const kiq = /<select[^>]*id="v4s-pilot"[^>]*>[\s\S]*?<\/select>/.exec(html)?.[0] ?? '';
+    assert.equal(options(kiq)[1]?.text, 'Fallback case (SL-002)');
+  });
+
   it('public: keeps the technical-trial notice', () => {
     assert.match(renderForm('public'), /DK v4 technical preview: packets are technical-trial output/);
   });
