@@ -1194,7 +1194,9 @@ export default function V4StagingForm({ variant, pilots, lanes, requestIdPattern
           <option value="">{isPublic ? 'Select a KIQ' : 'Select a pilot'}</option>
           {pilots.map((option) => (
             <option key={option.value} value={option.value}>
-              {option.label}
+              {isPublic && option.description?.title
+                ? `${option.description.title} (${option.value})`
+                : option.label}
             </option>
           ))}
         </select>
